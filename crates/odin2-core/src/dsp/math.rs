@@ -10,20 +10,13 @@ use libm::{expf, powf, sinf};
 /// ln(2) / 12 - used for semitone to frequency conversion
 pub const LN2_OVER_12: f32 = 0.057762265;
 
-/// Fast exponential approximation
-///
-/// Uses a polynomial approximation for small inputs, falls back to libm for large values.
-/// Accurate within ~0.1% for inputs in [-4, 4]
+/// Approximation de Padé utilisée par `juce::dsp::FastMathApproximations::exp`.
+/// Les consommateurs doivent respecter le domaine de leur algorithme C++.
 #[inline]
 pub fn fast_exp(x: f32) -> f32 {
-    // For small inputs, use fast approximation (Pade approximant)
-    if x > -4.0 && x < 4.0 {
-        let numerator = 1680.0 + x * (840.0 + x * (180.0 + x * (20.0 + x)));
-        let denominator = 1680.0 + x * (-840.0 + x * (180.0 + x * (-20.0 + x)));
-        numerator / denominator
-    } else {
-        expf(x)
-    }
+    let numerator = 1680.0 + x * (840.0 + x * (180.0 + x * (20.0 + x)));
+    let denominator = 1680.0 + x * (-840.0 + x * (180.0 + x * (-20.0 + x)));
+    numerator / denominator
 }
 
 /// Fast tanh approximation
@@ -32,10 +25,6 @@ pub fn fast_exp(x: f32) -> f32 {
 /// Essential for filter saturation and soft clipping.
 #[inline]
 pub fn fast_tanh(x: f32) -> f32 {
-    // Clamp to avoid overflow
-    let x = x.clamp(-10.0, 10.0);
-
-    // Fast rational approximation
     let x2 = x * x;
     let a = x * (135135.0 + x2 * (17325.0 + x2 * (378.0 + x2)));
     let b = 135135.0 + x2 * (62370.0 + x2 * (3150.0 + x2 * 28.0));
@@ -48,9 +37,10 @@ pub fn fast_tanh(x: f32) -> f32 {
 /// Input should be in range (-PI/2, PI/2).
 #[inline]
 pub fn fast_tan(x: f32) -> f32 {
-    // For the typical range used in filters (0.005 to 1.3), this approximation works well
     let x2 = x * x;
-    x * (1.0 + x2 * (0.333333333 + x2 * (0.133333333 + x2 * 0.053968254)))
+    let numerator = x * (-135135.0 + x2 * (17325.0 + x2 * (-378.0 + x2)));
+    let denominator = -135135.0 + x2 * (62370.0 + x2 * (-3150.0 + 28.0 * x2));
+    numerator / denominator
 }
 
 /// Fast sine approximation using Bhaskara I's formula
@@ -91,7 +81,9 @@ pub fn pitch_shift_multiplier(semitones: f32) -> f32 {
 /// A4 (note 69) = 440 Hz
 #[inline]
 pub fn midi_to_freq(note: u8) -> f32 {
-    440.0 * pitch_shift_multiplier((note as f32) - 69.0)
+    // Tunings::Tuning::frequencyForMidiNote (TuningsImpl.h:495): MIDI_0_FREQ * 2^(note/12) en double;
+    // l'approximation de Padé de `pitch_shift_multiplier` s'écarte de 3e-5 à ±36 demi-tons.
+    (8.17579891564371 * libm::exp2(note as f64 / 12.0)) as f32
 }
 
 /// Convert frequency to MIDI note number

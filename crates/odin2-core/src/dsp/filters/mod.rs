@@ -10,6 +10,7 @@ pub mod korg35;
 pub mod ladder;
 pub mod sem;
 pub mod va_one_pole;
+pub mod preset_filter;
 
 pub use biquad::{BiquadAllpass, BiquadFilter, BiquadResonator};
 pub use comb::CombFilter;
@@ -21,23 +22,31 @@ pub use korg35::Korg35Filter;
 pub use ladder::LadderFilter;
 pub use sem::SemFilter;
 pub use va_one_pole::VAOnePoleFilter;
+pub use preset_filter::{FilterModulation, PresetFilter};
+
+/// Saturation amont OdinFilterBase.h:66-74, sans normalisation de gain.
+pub(crate) fn saturate(input: f32, amount: f32, factor: f32) -> f32 {
+    if amount >= 1.0 {
+        crate::dsp::math::fast_tanh(factor * amount * input)
+    } else if amount > 0.01 {
+        input * (1.0 - amount)
+            + amount * crate::dsp::math::fast_tanh(factor * input)
+    } else {
+        input
+    }
+}
 
 /// Filter type for ladder filter
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum LadderFilterType {
+    #[default]
     LP4 = 0,
     LP2 = 1,
     BP4 = 2,
     BP2 = 3,
     HP4 = 4,
     HP2 = 5,
-}
-
-impl Default for LadderFilterType {
-    fn default() -> Self {
-        Self::LP4
-    }
 }
 
 /// Common filter trait

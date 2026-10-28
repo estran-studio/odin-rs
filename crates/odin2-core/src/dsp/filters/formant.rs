@@ -187,10 +187,10 @@ impl Filter for FormantFilter {
     fn process(&mut self, input: f32) -> f32 {
         self.update();
 
-        // Chain the resonators
-        let out = self.resonator1.process(self.resonator2.process(input));
+        // FormantFilter.cpp:62-64: chaîne en double, puis `* float * 0.35f`.
+        let out = self.resonator1.process_f64(self.resonator2.process_f64(input as f64));
 
-        out * self.samplerate_gain_compensation * FORMANT_OUTPUT_SCALAR
+        (out * self.samplerate_gain_compensation as f64 * FORMANT_OUTPUT_SCALAR as f64) as f32
     }
 
     fn set_cutoff(&mut self, _cutoff: f32) {

@@ -7,7 +7,7 @@
 
 use super::va_one_pole::VAOnePoleFilter;
 use super::{Filter, LadderFilterType};
-use crate::dsp::math::{fast_tan, fast_tanh};
+use crate::dsp::math::fast_tan;
 use crate::constants::TWO_PI;
 
 /// Maximum resonance value (before self-oscillation)
@@ -101,7 +101,7 @@ impl LadderFilter {
 
     /// Set overdrive amount (0 to 1)
     pub fn set_overdrive(&mut self, overdrive: f32) {
-        self.overdrive = overdrive.clamp(0.0, 1.0);
+        self.overdrive = overdrive.max(0.0);
     }
 
     /// Update filter coefficients
@@ -195,12 +195,7 @@ impl LadderFilter {
     /// Apply overdrive/saturation to output
     #[inline]
     fn apply_overdrive(&self, input: f32) -> f32 {
-        if self.overdrive > 0.0 {
-            let drive = 1.0 + self.overdrive * 3.0; // 1 to 4x drive
-            fast_tanh(input * drive) / fast_tanh(drive)
-        } else {
-            input
-        }
+        super::saturate(input, self.overdrive, 3.5)
     }
 }
 
@@ -233,7 +228,7 @@ impl Filter for LadderFilter {
 
     fn set_cutoff(&mut self, cutoff: f32) {
         // Clamp to valid range
-        self.cutoff = cutoff.clamp(20.0, self.sample_rate * 0.45);
+        self.cutoff = cutoff.clamp(20.0, 20000.0);
     }
 
     fn set_resonance(&mut self, resonance: f32) {

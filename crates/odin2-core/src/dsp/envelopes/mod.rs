@@ -5,19 +5,14 @@ pub mod adsr;
 pub use adsr::Adsr;
 
 /// Envelope state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EnvelopeState {
+    #[default]
     Idle,
     Attack,
     Decay,
     Sustain,
     Release,
-}
-
-impl Default for EnvelopeState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 /// Common envelope trait

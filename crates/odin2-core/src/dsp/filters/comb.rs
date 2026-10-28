@@ -6,14 +6,13 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use crate::dsp::filters::dc_blocker::DCBlockingFilter;
-use crate::dsp::math::{lerp, pitch_shift_multiplier};
+use crate::dsp::math::{fast_exp, LN2_OVER_12};
 
 /// Minimum comb frequency (sets maximum delay time)
 const COMB_FC_MIN: f32 = 40.0;
 
-/// Buffer length for maximum expected sample rate
-const COMB_BUFFER_LENGTH: usize = 192000 / 40 + 100; // ~5000 samples
+/// Longueur du tampon: CombFilter.h:23, `MAX_EXPECTED_SAMPLE_RATE / COMB_FC_MIN * 1.1f`.
+const COMB_BUFFER_LENGTH: usize = (192000.0_f32 / 40.0 * 1.1_f32) as usize;
 
 /// Comb filter
 pub struct CombFilter {
@@ -30,16 +29,13 @@ pub struct CombFilter {
     delay_time_control: f32,
 
     /// Delay time smoothed
-    delay_time_smooth: f32,
+    delay_time_smooth: f64,
 
     /// Feedback amount (-1.0 to 1.0)
     feedback: f32,
 
     /// Positive or negative comb (1 or -1)
     positive_comb: i8,
-
-    /// DC blocking filter
-    dc_blocker: DCBlockingFilter,
 
     /// Reset smoothing flag
     reset_smoothing: bool,
@@ -48,18 +44,14 @@ pub struct CombFilter {
 impl CombFilter {
     /// Create a new comb filter
     pub fn new(sample_rate: f32) -> Self {
-        let mut dc_blocker = DCBlockingFilter::new();
-        dc_blocker.set_sample_rate(sample_rate);
-
         Self {
             buffer: Box::new([0.0; COMB_BUFFER_LENGTH]),
             write_index: 0,
             sample_rate,
             delay_time_control: 1.0 / 2000.0,
-            delay_time_smooth: 1.0 / 2000.0,
+            delay_time_smooth: 1.0 / 2000.0_f32 as f64,
             feedback: 0.0,
             positive_comb: 1,
-            dc_blocker,
             reset_smoothing: false,
         }
     }
@@ -93,7 +85,6 @@ impl CombFilter {
     /// Set sample rate
     pub fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate;
-        self.dc_blocker.set_sample_rate(sample_rate);
     }
 
     /// Reset the filter
@@ -102,8 +93,7 @@ impl CombFilter {
         for i in 0..COMB_BUFFER_LENGTH {
             self.buffer[i] = 0.0;
         }
-        self.dc_blocker.reset();
-        self.delay_time_smooth = self.delay_time_control;
+        self.delay_time_smooth = self.delay_time_control as f64;
         self.reset_smoothing = true;
     }
 
@@ -116,18 +106,21 @@ impl CombFilter {
     pub fn process_with_modulation(&mut self, input: f32, freq_mod_semitones: f32) -> f32 {
         // Handle reset smoothing
         if self.reset_smoothing {
-            self.delay_time_smooth = self.delay_time_control;
+            self.delay_time_smooth = self.delay_time_control as f64;
             self.reset_smoothing = false;
         }
 
         // Smooth delay time
-        self.delay_time_smooth =
-            (self.delay_time_smooth - self.delay_time_control) * 0.999 + self.delay_time_control;
+        // `m_delay_time_smooth` est un double amont: en f32 le lissage 0.999 cale à ~500 ulp de la
+        // cible (≈ 0,003 échantillon de délai d'erreur permanente).
+        let control = self.delay_time_control as f64;
+        self.delay_time_smooth = (self.delay_time_smooth - control) * 0.999 + control;
 
-        // Apply frequency modulation
-        let mut delay_time_modded = self.delay_time_smooth;
-        if freq_mod_semitones.abs() > 0.001 {
-            delay_time_modded *= pitch_shift_multiplier(-freq_mod_semitones);
+        // CombFilter.cpp:36-43: toujours la Padé de juce (sans repli `std::exp` au-delà de
+        // ±48 demi-tons, contrairement à OdinFilterBase::pitchShiftMultiplier).
+        let mut delay_time_modded = self.delay_time_smooth as f32;
+        if freq_mod_semitones != 0.0 {
+            delay_time_modded *= fast_exp(LN2_OVER_12 * -freq_mod_semitones);
         }
 
         // Clamp delay time
@@ -154,8 +147,8 @@ impl CombFilter {
         let idx0 = (read_index_trunc as usize) % COMB_BUFFER_LENGTH;
         let idx1 = (read_index_next as usize) % COMB_BUFFER_LENGTH;
 
-        // Linear interpolation for output
-        let output = lerp(self.buffer[idx0], self.buffer[idx1], frac);
+        // CombFilter.h:127: (1 - d) * low + d * high
+        let output = (1.0 - frac) * self.buffer[idx0] + frac * self.buffer[idx1];
 
         // Write to buffer with feedback
         self.buffer[self.write_index] =
@@ -164,9 +157,9 @@ impl CombFilter {
         // Increment write index
         self.write_index = (self.write_index + 1) % COMB_BUFFER_LENGTH;
 
-        // Mix and apply DC blocking
-        let ret = (input + output) * 0.5;
-        self.dc_blocker.process(ret)
+        // CombFilter.cpp:70-72 appelle le bloqueur DC mais renvoie `ret` inchangé: le retour du
+        // bloqueur est ignoré (aucun effet audible), il n'existe donc pas ici.
+        (input + output) * 0.5
     }
 
     /// Get the feedback lower limit (for modulation)

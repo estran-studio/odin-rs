@@ -106,24 +106,19 @@ impl BiquadEQ {
 }
 
 /// EQ band type for multi-band EQ
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EQBandType {
     /// Low shelf filter
     LowShelf,
     /// High shelf filter
     HighShelf,
     /// Peaking/parametric band
+    #[default]
     Peaking,
     /// Low pass filter
     LowPass,
     /// High pass filter
     HighPass,
-}
-
-impl Default for EQBandType {
-    fn default() -> Self {
-        Self::Peaking
-    }
 }
 
 /// Flexible EQ band that supports different filter types

@@ -11,6 +11,10 @@ pub mod pm;
 pub mod vector;
 pub mod wavetable;
 pub mod wavetable2d;
+pub mod draw;
+pub mod preset_oscillator;
+pub use draw::DrawTableBank;
+pub use preset_oscillator::{OscillatorModulation, PresetOscillator};
 
 pub use analog::AnalogOscillator;
 pub use chiptune::ChiptuneOscillator;
@@ -25,19 +29,14 @@ pub use wavetable::WavetableOscillator;
 pub use wavetable2d::{WavetableOsc2D, WAVETABLE_2D_PRESETS, NUMBER_OF_WAVETABLES_2D};
 
 /// Waveform types for analog oscillator
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum Waveform {
+    #[default]
     Saw = 0,
     Square = 1,
     Triangle = 2,
     Sine = 3,
-}
-
-impl Default for Waveform {
-    fn default() -> Self {
-        Self::Saw
-    }
 }
 
 /// Common oscillator trait

@@ -16,6 +16,7 @@ const FILTER_FC_MAX: f32 = 20000.0;
 /// - -1.0: Pure lowpass
 /// -  0.0: Band stop (notch)
 /// - +1.0: Pure highpass
+///
 /// Values in between create mixed responses.
 pub struct SemFilter {
     /// Sample rate
@@ -86,6 +87,12 @@ impl SemFilter {
         self.transition
     }
 
+    /// Q déjà transformé: la modulation s'ajoute après la courbe puissance quatre.
+    pub fn set_q_resonance(&mut self, q: f32) {
+        self.resonance = q.clamp(0.5, 25.0);
+        self.last_freq = -1.0;
+    }
+
     /// Update filter coefficients
     fn update_coefficients(&mut self) {
         let freq = self.cutoff.clamp(FILTER_FC_MIN, FILTER_FC_MAX);
@@ -100,12 +107,7 @@ impl SemFilter {
         let wa = 2.0 * self.sample_rate * fast_tan(wd * self.one_over_sample_rate * 0.5);
         let g = wa * self.one_over_sample_rate * 0.5;
 
-        // Resonance mapped to Q (0.5 to 25)
-        // resonance^4 = (resonance^2)^2
-        let res2 = self.resonance * self.resonance;
-        let res4 = res2 * res2;
-        let modded = 24.5 * res4 + 0.5;
-        self.resonance_modded = if modded < 0.5 { 0.5 } else if modded > 25.0 { 25.0 } else { modded };
+        self.resonance_modded = self.resonance.clamp(0.5, 25.0);
 
         let r = 1.0 / (2.0 * self.resonance_modded);
 
@@ -132,15 +134,13 @@ impl Filter for SemFilter {
         self.z2 = self.alpha * bpf + lpf;
 
         // Morph between filter types based on transition
-        let output = if self.transition < 0.0 {
+        if self.transition < 0.0 {
             // Transition from LP (-1) to BS (0)
             (1.0 + self.transition) * bsf - self.transition * lpf
         } else {
             // Transition from BS (0) to HP (1)
             self.transition * hpf + (1.0 - self.transition) * bsf
-        };
-
-        output
+        }
     }
 
     fn set_cutoff(&mut self, freq: f32) {
@@ -149,8 +149,8 @@ impl Filter for SemFilter {
     }
 
     fn set_resonance(&mut self, res: f32) {
-        self.resonance = res.clamp(0.0, 1.0);
-        self.last_freq = -1.0; // Force recalculation
+        let res = res.clamp(0.0, 1.0);
+        self.set_q_resonance(24.5 * res * res * res * res + 0.5);
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {
