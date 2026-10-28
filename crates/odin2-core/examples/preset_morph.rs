@@ -10,7 +10,6 @@ use odin2_core::preset::OdinPreset;
 use odin2_core::engine::{OdinEngine, SynthEngine};
 use hound::{WavSpec, WavWriter};
 use std::env;
-use std::process::Command;
 
 fn main() {
     println!("=== Odin 2 Scatter Morphing Example ===\n");
@@ -86,7 +85,7 @@ fn main() {
 
     // Load morphed preset into engine
     println!("\n--- Loading Morphed Preset into Engine ---");
-    engine.load_preset(&morphed_center);
+    engine.load_preset(&morphed_center).expect("Matrice de modulation du preset invalide");
     println!("✓ Loaded center blend into engine");
 
     // Generate audio if requested
@@ -157,7 +156,7 @@ fn generate_preview(filename: &str, sample_rate: f32, preset: &OdinPreset) {
     std::fs::create_dir_all(output_dir).expect("Failed to create output directory");
     
     let mut engine = OdinEngine::new(sample_rate);
-    engine.load_preset(preset);
+    engine.load_preset(preset).expect("Matrice de modulation du preset invalide");
 
     // Play a C Major Arpeggio
     let notes = [60, 64, 67, 72];
@@ -193,107 +192,6 @@ fn generate_preview(filename: &str, sample_rate: f32, preset: &OdinPreset) {
     let wav_path = format!("{}/{}", output_dir, filename);
     write_wav(&wav_path, &buffer, sample_rate as u32);
     println!("  ✓ Saved to {}", wav_path);
-}
-
-/// Generate a set of WAV files exploring the morph space
-fn generate_audio_files(sample_rate: f32, sources: &[(OdinPreset, f32, f32)]) {
-    // Create output directory
-    let output_dir = "samples/morphing";
-    std::fs::create_dir_all(output_dir).expect("Failed to create output directory");
-
-    // Melody to play
-    let melody = [
-        (60, 0.0, 0.5),   // C4
-        (64, 0.5, 0.5),   // E4
-        (67, 1.0, 0.5),   // G4
-        (72, 1.5, 0.5),   // C5
-        (67, 2.0, 0.5),   // G4
-        (64, 2.5, 0.5),   // E4
-        (60, 3.0, 1.0),   // C4 (long)
-    ];
-
-    // Define points to visit in the 2D space
-    let points = [
-        (-1.0, 1.0, "top_left"),
-        (1.0, 1.0, "top_right"),
-        (-1.0, -1.0, "bottom_left"),
-        (1.0, -1.0, "bottom_right"),
-        (0.0, 0.0, "center"),
-        (0.0, 1.0, "top_edge"),
-        (0.0, -1.0, "bottom_edge"),
-        (-1.0, 0.0, "left_edge"),
-        (1.0, 0.0, "right_edge"),
-    ];
-
-    for (x, y, name) in &points {
-        println!("Generating: morph_{}.wav (x={:.1}, y={:.1})", name, x, y);
-
-        let preset = OdinPreset::morph_2d(sources, *x, *y);
-        let audio = render_melody(&preset, &melody, sample_rate);
-
-        let wav_path = format!("{}/morph_{}.wav", output_dir, name);
-        write_wav(&wav_path, &audio, sample_rate as u32);
-        println!("  ✓ Saved to {}", wav_path);
-    }
-}
-
-/// Render a melody with a given preset
-fn render_melody(
-    preset: &OdinPreset,
-    melody: &[(u8, f32, f32)], // (note, start_time, duration)
-    sample_rate: f32,
-) -> Vec<f32> {
-    let mut engine = OdinEngine::new(sample_rate);
-    engine.load_preset(preset);
-
-    // Calculate total duration
-    let total_duration = melody.iter()
-        .map(|(_, start, dur)| start + dur)
-        .fold(0.0f32, |a, b| a.max(b));
-
-    let num_samples = (sample_rate * total_duration) as usize;
-    let mut buffer = vec![0.0f32; num_samples * 2]; // Stereo
-
-    // Convert melody to sample-based events
-    let note_events: Vec<(u8, usize, usize)> = melody.iter()
-        .map(|(note, start, dur)| {
-            let start_sample = (start * sample_rate) as usize;
-            let duration_samples = (dur * sample_rate) as usize;
-            (*note, start_sample, duration_samples)
-        })
-        .collect();
-
-    // Track active notes for note-off
-    let mut active_notes: Vec<(u8, usize)> = Vec::new(); // (note, release_sample)
-
-    for i in 0..num_samples {
-        // Trigger new notes
-        for &(note, start_sample, duration_samples) in &note_events {
-            if i == start_sample {
-                engine.note_on(note, 100);
-                active_notes.push((note, start_sample + duration_samples));
-            }
-        }
-
-        // Release notes
-        active_notes.retain(|(note, release_sample)| {
-            if i >= *release_sample {
-                engine.note_off(*note);
-                false
-            } else {
-                true
-            }
-        });
-
-        // Process one sample
-        let mut sample_buf = [0.0f32, 0.0f32];
-        engine.process(&mut sample_buf, 2);
-
-        buffer[i * 2] = sample_buf[0];
-        buffer[i * 2 + 1] = sample_buf[1];
-    }
-
-    buffer
 }
 
 /// Write stereo audio to WAV file
@@ -345,8 +243,8 @@ fn generate_linear_transition(
         // Interpolate preset
         let current_preset = start_preset.interpolate(end_preset, t);
         
-        // Load into engine (affects next note on)
-        engine.load_preset(&current_preset);
+        // Chargement complet hors callback : arrête les voix du patch précédent.
+        engine.load_preset(&current_preset).expect("Matrice de modulation du preset invalide");
         
         // Play note
         let note = notes[i % notes.len()];
@@ -407,7 +305,7 @@ fn generate_path_morph(
         let morphed_preset = OdinPreset::morph_2d(sources, x, y);
         
         // Update Engine
-        engine.load_preset(&morphed_preset);
+        engine.load_preset(&morphed_preset).expect("Matrice de modulation du preset invalide");
         
         // Play note
         let note = notes[i % notes.len()];
@@ -474,7 +372,7 @@ fn generate_circle_morph(
         let morphed_preset = OdinPreset::morph_2d(sources, x, y);
         
         // Update Engine
-        engine.load_preset(&morphed_preset);
+        engine.load_preset(&morphed_preset).expect("Matrice de modulation du preset invalide");
         
         // Play note
         let note = notes[i % notes.len()];
@@ -537,7 +435,7 @@ fn generate_drum_circle_morph(
         let morphed_preset = OdinPreset::morph_2d(sources, x, y);
         
         // Update Engine
-        engine.load_preset(&morphed_preset);
+        engine.load_preset(&morphed_preset).expect("Matrice de modulation du preset invalide");
         
         // Play note
         engine.note_on(note, 100);

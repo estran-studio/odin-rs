@@ -4,8 +4,23 @@
 //! transposed structure. Used as a building block for allpass, resonator,
 //! and other filter types.
 
-use crate::dsp::math::fast_cos;
 use core::f32::consts::PI;
+
+/// `juce::dsp::FastMathApproximations::cos<double>`: Padé valable sur [-π, π].
+fn juce_cos(x: f64) -> f64 {
+    let x2 = x * x;
+    let numerator = -(-39251520.0 + x2 * (18471600.0 + x2 * (-1075032.0 + 14615.0 * x2)));
+    let denominator = 39251520.0 + x2 * (1154160.0 + x2 * (16632.0 + x2 * 127.0));
+    numerator / denominator
+}
+
+/// `juce::dsp::FastMathApproximations::cos<float>`.
+fn juce_cos_f32(x: f32) -> f32 {
+    let x2 = x * x;
+    let numerator = -(-39251520.0 + x2 * (18471600.0 + x2 * (-1075032.0 + 14615.0 * x2)));
+    let denominator = 39251520.0 + x2 * (1154160.0 + x2 * (16632.0 + x2 * 127.0));
+    numerator / denominator
+}
 
 /// Biquad filter using Direct Form II transposed
 #[derive(Debug, Clone)]
@@ -108,24 +123,16 @@ impl BiquadAllpass {
 
     /// Set the center frequency
     pub fn set_frequency(&mut self, freq: f32) {
-        // Clamp frequency to valid range
-        let freq = freq.clamp(20.0, self.filter.sample_rate() * 0.49);
-        let w0 = 2.0 * PI * freq * self.filter.one_over_sample_rate();
-
-        // Second-order allpass filter coefficients
-        // Using standard biquad allpass design
-        let cos_w0 = fast_cos(w0);
-        let alpha = libm::sinf(w0) / (2.0 * self.radius);
-
-        // Normalize by a0
-        let a0 = 1.0 + alpha;
-        let a0_inv = 1.0 / a0;
-
-        self.filter.b0 = (1.0 - alpha) * a0_inv;
-        self.filter.b1 = -2.0 * cos_w0 * a0_inv;
-        self.filter.b2 = (1.0 + alpha) * a0_inv;
-        self.filter.a1 = -2.0 * cos_w0 * a0_inv;
-        self.filter.a2 = (1.0 - alpha) * a0_inv;
+        // BiquadAllpass.cpp:30-37: H(z) = (1/r² - 2/r·cos·z⁻¹ + z⁻²) / (1 - 2/r·cos·z⁻¹ + 1/r²·z⁻²),
+        // cosinus de juce évalué en float.
+        let freq_rad = freq * self.filter.one_over_sample_rate() * 2.0 * PI;
+        let b1 = -2.0 / self.radius * juce_cos_f32(freq_rad);
+        let r2 = 1.0 / (self.radius * self.radius);
+        self.filter.b0 = r2;
+        self.filter.b1 = b1;
+        self.filter.b2 = 1.0;
+        self.filter.a1 = b1;
+        self.filter.a2 = r2;
     }
 
     /// Reset filter state
@@ -140,36 +147,49 @@ impl BiquadAllpass {
     }
 }
 
-/// Biquad resonator for formant filter
+/// Résonateur du filtre de formants (BiquadResonator.h + BiquadFilter.cpp:26-37).
+///
+/// Coefficients et mémoires en double comme l'amont: le pôle de rayon 0,996 a une bande passante
+/// de ~4e-3 rad, un coefficient `a1 ≈ -2` quantifié en f32 (ulp 1,2e-7) y fait ~1e-4 d'erreur
+/// relative sur le gain de crête.
 #[derive(Debug, Clone)]
 pub struct BiquadResonator {
-    filter: BiquadFilter,
+    b0: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    z1: f64,
+    z2: f64,
     radius: f32,
     freq: f32,
+    one_over_sample_rate: f32,
 }
 
-/// Gain factor for resonator
-const RESONATOR_GAIN_FACTOR: f32 = 0.08;
+/// Gain factor for resonator (RESONATOR_GAIN_FACTOR, double)
+const RESONATOR_GAIN_FACTOR: f64 = 0.08;
 
 impl BiquadResonator {
     /// Create a new biquad resonator
     pub fn new(sample_rate: f32) -> Self {
-        let mut filter = BiquadFilter::new(sample_rate);
-        // Initial resonator coefficients with zeros at 0 and Nyquist
-        filter.b0 = RESONATOR_GAIN_FACTOR;
-        filter.b1 = 0.0;
-        filter.b2 = -RESONATOR_GAIN_FACTOR;
-
-        Self {
-            filter,
+        let mut resonator = Self {
+            // Zéros à 0 et Nyquist (BiquadResonator.h:19-26), b1 = 0.
+            b0: RESONATOR_GAIN_FACTOR,
+            b2: -RESONATOR_GAIN_FACTOR,
+            a1: 0.0,
+            a2: 0.0,
+            z1: 0.0,
+            z2: 0.0,
             radius: 0.996,
             freq: 2000.0,
-        }
+            one_over_sample_rate: 1.0 / sample_rate,
+        };
+        resonator.recalculate_coefficients();
+        resonator
     }
 
     /// Set sample rate
     pub fn set_sample_rate(&mut self, sample_rate: f32) {
-        self.filter.set_sample_rate(sample_rate);
+        self.one_over_sample_rate = 1.0 / sample_rate;
         self.recalculate_coefficients();
     }
 
@@ -187,22 +207,35 @@ impl BiquadResonator {
 
     /// Recalculate filter coefficients
     fn recalculate_coefficients(&mut self) {
-        let w0 = 2.0 * PI * self.freq * self.filter.one_over_sample_rate();
-        let cos_w0 = fast_cos(w0);
-
-        self.filter.a1 = -2.0 * self.radius * cos_w0;
-        self.filter.a2 = self.radius * self.radius;
+        // BiquadResonator.h:52: l'argument est un double (`2 * M_PI * float * float`) et la Padé de
+        // juce `FastMathApproximations::cos<double>` en est évaluée (un cosinus exact décalerait le
+        // pôle de ~1e-4 relatif sur le gain de crête); `m_a2 = m_radius * m_radius` est un produit float.
+        let w0 = 2.0 * core::f64::consts::PI * self.freq as f64 * self.one_over_sample_rate as f64;
+        self.a1 = -2.0 * self.radius as f64 * juce_cos(w0);
+        self.a2 = (self.radius * self.radius) as f64;
     }
 
     /// Reset filter state
     pub fn reset(&mut self) {
-        self.filter.reset();
+        self.z1 = 0.0;
+        self.z2 = 0.0;
+    }
+
+    /// Une étape en double (BiquadFilter::doFilter, forme directe II): le filtre de formants
+    /// enchaîne ses deux résonateurs sans arrondi intermédiaire en float.
+    #[inline]
+    pub fn process_f64(&mut self, input: f64) -> f64 {
+        let left_side = input - self.z2 * self.a2 - self.z1 * self.a1;
+        let output = self.b2 * self.z2 + self.b0 * left_side;
+        self.z2 = self.z1;
+        self.z1 = left_side;
+        output
     }
 
     /// Process one sample
     #[inline]
     pub fn process(&mut self, input: f32) -> f32 {
-        self.filter.process(input)
+        self.process_f64(input as f64) as f32
     }
 }
 

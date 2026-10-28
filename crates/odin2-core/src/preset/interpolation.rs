@@ -137,6 +137,12 @@ impl OdinPreset {
             name,
             version_minor: self.version_minor,
             version_patch: self.version_patch,
+            patch_migration_version: switch_at_half(&self.patch_migration_version, &other.patch_migration_version, t),
+            bpm: lerp_f32(self.bpm, other.bpm, t),
+            fx_positions: switch_at_half(&self.fx_positions, &other.fx_positions, t),
+            modwheel: lerp_f32(self.modwheel, other.modwheel, t),
+            pitchbend: lerp_f32(self.pitchbend, other.pitchbend, t),
+            ui: switch_at_half(&self.ui, &other.ui, t),
 
             // === Oscillators ===
             osc1: interpolate_oscillator(&self.osc1, &other.osc1, t),
@@ -210,21 +216,24 @@ fn interpolate_oscillator(a: &OscillatorParams, b: &OscillatorParams, t: f32) ->
         step_3_on: switch_at_half(&a.step_3_on, &b.step_3_on, t),
         chipnoise: switch_at_half(&a.chipnoise, &b.chipnoise, t),
         exp_fm: switch_at_half(&a.exp_fm, &b.exp_fm, t),
+        wavedraw: core::array::from_fn(|i| lerp_f32(a.wavedraw[i], b.wavedraw[i], t)),
+        chipdraw: core::array::from_fn(|i| lerp_f32(a.chipdraw[i], b.chipdraw[i], t)),
+        specdraw: core::array::from_fn(|i| lerp_f32(a.specdraw[i], b.specdraw[i], t)),
 
         // Integer parameters (lerp + round)
         octave: lerp_i32(a.octave, b.octave, t),
         semitones: lerp_i32(a.semitones, b.semitones, t),
-        wavetable: lerp_i32(a.wavetable, b.wavetable, t),
-        chipwave: lerp_i32(a.chipwave, b.chipwave, t),
-        vec_a: lerp_i32(a.vec_a, b.vec_a, t),
-        vec_b: lerp_i32(a.vec_b, b.vec_b, t),
-        vec_c: lerp_i32(a.vec_c, b.vec_c, t),
-        vec_d: lerp_i32(a.vec_d, b.vec_d, t),
-        modulator_wave: lerp_i32(a.modulator_wave, b.modulator_wave, t),
-        carrier_wave: lerp_i32(a.carrier_wave, b.carrier_wave, t),
-        mod_source: lerp_i32(a.mod_source, b.mod_source, t),
-        carrier_ratio: lerp_i32(a.carrier_ratio, b.carrier_ratio, t),
-        modulator_ratio: lerp_i32(a.modulator_ratio, b.modulator_ratio, t),
+        wavetable: switch_at_half(&a.wavetable, &b.wavetable, t),
+        chipwave: switch_at_half(&a.chipwave, &b.chipwave, t),
+        vec_a: switch_at_half(&a.vec_a, &b.vec_a, t),
+        vec_b: switch_at_half(&a.vec_b, &b.vec_b, t),
+        vec_c: switch_at_half(&a.vec_c, &b.vec_c, t),
+        vec_d: switch_at_half(&a.vec_d, &b.vec_d, t),
+        modulator_wave: switch_at_half(&a.modulator_wave, &b.modulator_wave, t),
+        carrier_wave: switch_at_half(&a.carrier_wave, &b.carrier_wave, t),
+        mod_source: switch_at_half(&a.mod_source, &b.mod_source, t),
+        carrier_ratio: switch_at_half(&a.carrier_ratio, &b.carrier_ratio, t),
+        modulator_ratio: switch_at_half(&a.modulator_ratio, &b.modulator_ratio, t),
         step_1: lerp_i32(a.step_1, b.step_1, t),
         step_2: lerp_i32(a.step_2, b.step_2, t),
         step_3: lerp_i32(a.step_3, b.step_3, t),
@@ -298,8 +307,8 @@ fn interpolate_lfo(a: &LfoParams, b: &LfoParams, t: f32) -> LfoParams {
         sync: switch_at_half(&a.sync, &b.sync, t),
 
         // Integer parameters
-        sync_numerator: lerp_i32(a.sync_numerator, b.sync_numerator, t),
-        sync_denominator: lerp_i32(a.sync_denominator, b.sync_denominator, t),
+        sync_numerator: switch_at_half(&a.sync_numerator, &b.sync_numerator, t),
+        sync_denominator: switch_at_half(&a.sync_denominator, &b.sync_denominator, t),
 
         // Continuous parameters
         frequency: lerp_f32(a.frequency, b.frequency, t),
@@ -312,6 +321,8 @@ fn interpolate_delay(a: &DelayParams, b: &DelayParams, t: f32) -> DelayParams {
         on: switch_at_half(&a.on, &b.on, t),
         sync: switch_at_half(&a.sync, &b.sync, t),
         pingpong: switch_at_half(&a.pingpong, &b.pingpong, t),
+        sync_numerator: switch_at_half(&a.sync_numerator, &b.sync_numerator, t),
+        sync_denominator: switch_at_half(&a.sync_denominator, &b.sync_denominator, t),
 
         // Continuous parameters
         time: lerp_f32(a.time, b.time, t),
@@ -344,6 +355,8 @@ fn interpolate_chorus(a: &ChorusParams, b: &ChorusParams, t: f32) -> ChorusParam
         on: switch_at_half(&a.on, &b.on, t),
         sync: switch_at_half(&a.sync, &b.sync, t),
         reset: switch_at_half(&a.reset, &b.reset, t),
+        sync_numerator: switch_at_half(&a.sync_numerator, &b.sync_numerator, t),
+        sync_denominator: switch_at_half(&a.sync_denominator, &b.sync_denominator, t),
 
         // Continuous parameters
         amount: lerp_f32(a.amount, b.amount, t),
@@ -359,6 +372,8 @@ fn interpolate_phaser(a: &PhaserParams, b: &PhaserParams, t: f32) -> PhaserParam
         on: switch_at_half(&a.on, &b.on, t),
         sync: switch_at_half(&a.sync, &b.sync, t),
         reset: switch_at_half(&a.reset, &b.reset, t),
+        sync_numerator: switch_at_half(&a.sync_numerator, &b.sync_numerator, t),
+        sync_denominator: switch_at_half(&a.sync_denominator, &b.sync_denominator, t),
 
         // Continuous parameters
         frequency: lerp_f32(a.frequency, b.frequency, t),
@@ -375,6 +390,8 @@ fn interpolate_flanger(a: &FlangerParams, b: &FlangerParams, t: f32) -> FlangerP
         on: switch_at_half(&a.on, &b.on, t),
         sync: switch_at_half(&a.sync, &b.sync, t),
         reset: switch_at_half(&a.reset, &b.reset, t),
+        sync_numerator: switch_at_half(&a.sync_numerator, &b.sync_numerator, t),
+        sync_denominator: switch_at_half(&a.sync_denominator, &b.sync_denominator, t),
 
         // Continuous parameters
         amount: lerp_f32(a.amount, b.amount, t),
@@ -403,15 +420,15 @@ fn interpolate_mod_matrix(
 ) -> [ModMatrixRow; 9] {
     core::array::from_fn(|i| ModMatrixRow {
         // Switch sources/dests at 0.5
-        source: lerp_i32(a[i].source, b[i].source, t),
-        dest1: lerp_i32(a[i].dest1, b[i].dest1, t),
-        dest2: lerp_i32(a[i].dest2, b[i].dest2, t),
-        scale: lerp_i32(a[i].scale, b[i].scale, t),
+        source: switch_at_half(&a[i].source, &b[i].source, t),
+        dest1: switch_at_half(&a[i].dest1, &b[i].dest1, t),
+        dest2: switch_at_half(&a[i].dest2, &b[i].dest2, t),
+        scale: switch_at_half(&a[i].scale, &b[i].scale, t),
 
         // Interpolate amounts smoothly
-        amount0: lerp_f32(a[i].amount0, b[i].amount0, t),
-        amount1: lerp_f32(a[i].amount1, b[i].amount1, t),
-        amount2: lerp_f32(a[i].amount2, b[i].amount2, t),
+        dest1_amount: lerp_f32(a[i].dest1_amount, b[i].dest1_amount, t),
+        dest2_amount: lerp_f32(a[i].dest2_amount, b[i].dest2_amount, t),
+        scale_amount: lerp_f32(a[i].scale_amount, b[i].scale_amount, t),
     })
 }
 
@@ -453,6 +470,28 @@ fn interpolate_arpeggiator(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn morph_preserves_discontinuous_ids_and_interpolates_drawings() {
+        let mut a = OdinPreset::default();
+        let mut b = OdinPreset::default();
+        a.mod_matrix[0].source = 200;
+        b.mod_matrix[0].source = 999;
+        a.osc1.vec_a = 101;
+        b.osc1.vec_a = 601;
+        a.osc1.wavedraw[17] = -1.0;
+        b.osc1.wavedraw[17] = 1.0;
+        b.fx_positions = [4, 3, 2, 1, 0];
+        let first = a.interpolate(&b, 0.25);
+        assert_eq!(first.mod_matrix[0].source, 200);
+        assert_eq!(first.osc1.vec_a, 101);
+        assert_eq!(first.osc1.wavedraw[17], -0.5);
+        assert_eq!(first.fx_positions, a.fx_positions);
+        let second = a.interpolate(&b, 0.75);
+        assert_eq!(second.mod_matrix[0].source, 999);
+        assert_eq!(second.osc1.vec_a, 601);
+        assert_eq!(second.fx_positions, b.fx_positions);
+    }
 
     #[test]
     fn test_lerp_f32() {

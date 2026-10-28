@@ -4,7 +4,7 @@
 //! Based on Will Pirkle's implementation from "Designing Software Synthesizer Plug-Ins in C++".
 
 use super::{Filter, VAOnePoleFilter};
-use crate::dsp::math::{fast_tan, fast_tanh};
+use crate::dsp::math::fast_tan;
 
 /// Filter frequency limits
 const FILTER_FC_MIN: f32 = 20.0;
@@ -94,18 +94,12 @@ impl Korg35Filter {
 
     /// Set overdrive amount (0.0 to 1.0)
     pub fn set_overdrive(&mut self, amount: f32) {
-        self.overdrive = amount.clamp(0.0, 1.0);
+        self.overdrive = amount.max(0.0);
     }
 
     /// Apply overdrive saturation
     fn apply_overdrive(&self, input: f32) -> f32 {
-        if self.overdrive > 0.001 {
-            // Softer drive for Korg35 (3.0 instead of 5.0)
-            let drive = 1.0 + self.overdrive * 2.0;
-            fast_tanh(input * drive) / fast_tanh(drive)
-        } else {
-            input
-        }
+        super::saturate(input, self.overdrive, 3.0)
     }
 
     /// Update filter coefficients

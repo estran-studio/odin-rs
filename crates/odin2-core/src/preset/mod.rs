@@ -10,9 +10,9 @@ mod value_tree;
 mod interpolation;
 
 #[cfg(feature = "std")]
-pub use parser::OdinPreset;
+pub use parser::{OdinPreset, PresetAudit, PresetUiState};
 #[cfg(feature = "std")]
-pub use value_tree::{ValueTree, ValueTreeError, VariantValue};
+pub use value_tree::{ValueTree, ValueTreeNode, ValueTreeError, VariantValue};
 
 // Re-export types that work in no_std
 mod types;

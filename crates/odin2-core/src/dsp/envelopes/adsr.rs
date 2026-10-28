@@ -55,6 +55,8 @@ pub struct Adsr {
 
     /// Whether envelope loops (for LFO-like behavior)
     looping: bool,
+
+    modulation: [f32; 4],
 }
 
 impl Adsr {
@@ -75,9 +77,47 @@ impl Adsr {
             last_release_time: -1.0,
             release_start_value: 1.0,
             looping: false,
+            modulation: [0.0; 4],
         }
     }
 
+    /// Met à jour les contrôles sans réinitialiser l'enveloppe en cours.
+    pub fn configure(&mut self, params: &crate::preset::EnvelopeParams) {
+        self.set_attack(params.attack);
+        self.set_decay(params.decay);
+        self.set_sustain(params.sustain);
+        self.set_release(params.release);
+        self.set_looping(params.loop_env);
+    }
+
+    pub fn set_modulation(&mut self, modulation: [f32; 4]) {
+        self.modulation = modulation;
+    }
+
+    /// En legato, une enveloppe tenue ne repart pas en attaque (ADSR.cpp:155).
+    pub fn trigger_legato(&mut self) {
+        self.current_value = self.last_output;
+        if matches!(self.state, EnvelopeState::Idle | EnvelopeState::Release) {
+            self.trigger();
+        }
+    }
+
+    pub fn value(&self) -> f32 {
+        self.last_output
+    }
+
+    fn modulated_time(time: f32, modulation: f32, release: bool) -> f32 {
+        if modulation == 0.0 {
+            time
+        } else {
+            (time * powf(2.0, (if release { 6.0 } else { 3.0 }) * modulation)
+                + modulation * 0.3).max(ATTACK_LOWER_LIMIT)
+        }
+    }
+
+    fn modulated_sustain(&self) -> f32 {
+        (self.sustain + self.modulation[2]).clamp(0.0, 1.0)
+    }
     /// Set attack time in seconds
     pub fn set_attack(&mut self, attack: f32) {
         self.attack = attack.max(ATTACK_LOWER_LIMIT);
@@ -124,18 +164,20 @@ impl Adsr {
 
     /// Get decay factor (with caching)
     fn get_decay_factor(&mut self) -> f32 {
-        if self.decay != self.last_decay_time {
-            self.decay_factor = self.calc_exp_factor(self.decay);
-            self.last_decay_time = self.decay;
+        let decay = Self::modulated_time(self.decay, self.modulation[1], false);
+        if decay != self.last_decay_time {
+            self.decay_factor = self.calc_exp_factor(decay);
+            self.last_decay_time = decay;
         }
         self.decay_factor
     }
 
     /// Get release factor (with caching)
     fn get_release_factor(&mut self) -> f32 {
-        if self.release != self.last_release_time {
-            self.release_factor = self.calc_exp_factor(self.release);
-            self.last_release_time = self.release;
+        let release = Self::modulated_time(self.release, self.modulation[3], true);
+        if release != self.last_release_time {
+            self.release_factor = self.calc_exp_factor(release);
+            self.last_release_time = release;
         }
         self.release_factor
     }
@@ -151,7 +193,8 @@ impl Envelope for Adsr {
 
             EnvelopeState::Attack => {
                 // Linear attack
-                let attack_inc = 1.0 / (self.sample_rate * self.attack);
+                let attack = Self::modulated_time(self.attack, self.modulation[0], false);
+                let attack_inc = 1.0 / (self.sample_rate * attack);
                 self.current_value += attack_inc;
 
                 if self.current_value >= 1.0 {
@@ -167,11 +210,14 @@ impl Envelope for Adsr {
                 // Exponential decay towards sustain
                 let factor = self.get_decay_factor();
                 self.current_value *= factor;
+                let sustain = self.modulated_sustain();
 
                 if self.current_value < MIN_DECAY_RELEASE_VAL {
                     if self.looping {
                         self.state = EnvelopeState::Attack;
-                        self.current_value = self.sustain;
+                        self.current_value = sustain + (1.0 - sustain) * self.current_value;
+                        self.last_output = sustain;
+                        return sustain;
                     } else {
                         self.state = EnvelopeState::Sustain;
                         self.current_value = 0.0;
@@ -180,17 +226,18 @@ impl Envelope for Adsr {
 
                 // Scale output: sustain + (1 - sustain) * current_value
                 // This maps the exponential decay from 1->0 to 1->sustain
-                self.last_output = self.sustain + (1.0 - self.sustain) * self.current_value;
+                self.last_output = sustain + (1.0 - sustain) * self.current_value;
                 self.last_output
             }
 
             EnvelopeState::Sustain => {
+                let sustain = self.modulated_sustain();
                 if self.looping {
                     self.state = EnvelopeState::Attack;
-                    self.current_value = self.sustain;
+                    self.current_value = sustain + (1.0 - sustain) * self.current_value;
                 }
-                self.last_output = self.sustain;
-                self.sustain
+                self.last_output = sustain;
+                sustain
             }
 
             EnvelopeState::Release => {
@@ -224,13 +271,14 @@ impl Envelope for Adsr {
         }
 
         // Store the current output value as the release starting point
+        let sustain = self.modulated_sustain();
         match self.state {
             EnvelopeState::Decay => {
                 self.release_start_value =
-                    self.current_value * (1.0 - self.sustain) + self.sustain;
+                    self.current_value * (1.0 - sustain) + sustain;
             }
             EnvelopeState::Sustain => {
-                self.release_start_value = self.sustain;
+                self.release_start_value = sustain;
             }
             _ => {
                 self.release_start_value = self.last_output;
@@ -262,6 +310,40 @@ impl Envelope for Adsr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legato_keeps_sustain_but_restarts_release_from_current_output() {
+        let mut env = Adsr::new(1000.0);
+        env.set_attack(0.001);
+        env.set_decay(0.001);
+        env.set_sustain(0.4);
+        env.set_release(1.0);
+        env.trigger();
+        for _ in 0..10 { env.process(); }
+        assert_eq!(env.state(), EnvelopeState::Sustain);
+        env.trigger_legato();
+        assert_eq!(env.state(), EnvelopeState::Sustain);
+        assert_eq!(env.process(), 0.4);
+        env.release();
+        let value = env.process();
+        env.trigger_legato();
+        assert_eq!(env.state(), EnvelopeState::Attack);
+        assert_eq!(env.value(), value);
+    }
+
+    #[test]
+    fn attack_modulation_changes_time_not_output_amplitude() {
+        let mut env = Adsr::new(1000.0);
+        env.set_attack(0.1);
+        env.set_modulation([1.0, 0.0, 0.0, 0.0]);
+        env.trigger();
+        // ADSR.cpp:45: 0.1 * 2^3 + 0.3 = 1.1 seconde.
+        let first = env.process();
+        assert!((first - 1.0 / 1100.0).abs() < 1e-7);
+        for _ in 0..1200 { env.process(); }
+        assert!(env.value() <= 1.0);
+        assert_ne!(env.state(), EnvelopeState::Attack);
+    }
 
     #[test]
     fn test_adsr_trigger_and_release() {
@@ -326,7 +408,7 @@ mod tests {
 
         for _ in 0..50000 {
             let val = env.process();
-            assert!(val >= 0.0 && val <= 1.0, "Envelope out of range: {}", val);
+            assert!((0.0..=1.0).contains(&val), "Envelope out of range: {}", val);
         }
     }
 }

@@ -1,16 +1,57 @@
-//! Zita Reverb
+//! Réverbération Zita utilisée par Odin 2, GPL-3.0-or-later.
 //!
-//! A Rust port of the zita-rev1 based reverb from Odin 2.
-//! Uses an 8-channel feedback delay network with allpass diffusers.
+//! `FX/ZitaReverb.cpp:141-461`, `ZitaReverb.h:42-147`, `Filters/BiquadEQ.cpp:42-59`.
+//! Réseau huit voies, diffuseurs allpass et EQ double précision. Les buffers pour
+//! 192 kHz sont réservés dans new; changer les paramètres ou la fréquence n'alloue pas.
 
 extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
-
-use crate::dsp::filters::BiquadEQ;
+use super::common::MAX_SAMPLE_RATE;
 
 /// Default EQ Q for reverb
 const REVERB_EQ_Q_DEFAULT: f32 = 0.9;
+
+/// BiquadEQ.cpp:42-59 et BiquadFilter.cpp:32-44: coefficients/états double.
+struct OutputEq {
+    sample_rate: f32,
+    frequency: f32,
+    gain: f32,
+    a1: f64,
+    a2: f64,
+    b0: f64,
+    b2: f64,
+    z1: f64,
+    z2: f64,
+}
+impl OutputEq {
+    fn new(sample_rate: f32) -> Self {
+        let mut eq = Self { sample_rate, frequency: 1000.0, gain: 0.0,
+            a1: 0.0, a2: 0.0, b0: 1.0, b2: 0.0, z1: 0.0, z2: 0.0 };
+        eq.recalculate();
+        eq
+    }
+    fn set_sample_rate(&mut self, sample_rate: f32) { self.sample_rate = sample_rate; self.recalculate(); }
+    fn set_freq(&mut self, frequency: f32) { self.frequency = frequency; self.recalculate(); }
+    fn set_gain(&mut self, gain: f32) { self.gain = gain; self.recalculate(); }
+    fn recalculate(&mut self) {
+        let angle = self.frequency as f64 * 2.0 * core::f64::consts::PI * (1.0 / self.sample_rate) as f64;
+        let alpha = (libm::sin(angle) / (2.0 * REVERB_EQ_Q_DEFAULT) as f64) as f32;
+        let a = libm::pow(10.0, (self.gain / 40.0) as f64) as f32;
+        let a0 = (1.0_f64 + (alpha / a) as f64) as f32;
+        self.b0 = (1.0_f64 + (alpha * a) as f64) / a0 as f64;
+        self.a1 = -2.0 * libm::cos(angle) / a0 as f64;
+        self.b2 = ((1.0 - alpha * a) / a0) as f64;
+        self.a2 = ((1.0 - alpha / a) / a0) as f64;
+    }
+    fn process(&mut self, input: f32) -> f32 {
+        let left = input as f64 - self.z2 * self.a2 - self.z1 * self.a1;
+        let output = self.b2 * self.z2 + self.a1 * self.z1 + self.b0 * left;
+        self.z2 = self.z1;
+        self.z1 = left;
+        output as f32
+    }
+}
 
 /// Diffusion times in seconds for the 8 allpass diffusers
 const TDIFF1: [f32; 8] = [
@@ -33,9 +74,9 @@ struct Diff1 {
 }
 
 impl Diff1 {
-    fn new() -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
-            line: Vec::new(),
+            line: vec![0.0; capacity],
             index: 0,
             size: 0,
             c: 0.6,
@@ -45,7 +86,7 @@ impl Diff1 {
     fn init(&mut self, size: usize, c: f32) {
         self.size = size;
         self.c = c;
-        self.line = vec![0.0; size];
+        self.line.fill(0.0);
         self.index = 0;
     }
 
@@ -120,9 +161,9 @@ struct RevDelay {
 }
 
 impl RevDelay {
-    fn new() -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
-            line: Vec::new(),
+            line: vec![0.0; capacity],
             index: 0,
             size: 0,
         }
@@ -130,7 +171,7 @@ impl RevDelay {
 
     fn init(&mut self, size: usize) {
         self.size = size;
-        self.line = vec![0.0; size];
+        self.line.fill(0.0);
         self.index = 0;
     }
 
@@ -165,7 +206,7 @@ struct Vdelay {
 impl Vdelay {
     fn new() -> Self {
         Self {
-            line: Vec::new(),
+            line: vec![0.0; (0.1 * MAX_SAMPLE_RATE) as usize],
             ir: 0,
             iw: 0,
             size: 0,
@@ -174,23 +215,23 @@ impl Vdelay {
 
     fn init(&mut self, size: usize) {
         self.size = size;
-        self.line = vec![0.0; size];
+        self.line.fill(0.0);
         self.ir = 0;
         self.iw = 0;
     }
 
     fn reset(&mut self) {
         self.line.fill(0.0);
-        self.ir = 0;
-        self.iw = 0;
     }
 
-    fn set_delay(&mut self, del: usize) {
-        if del <= self.iw {
-            self.ir = self.iw - del;
-        } else {
-            self.ir = self.size - (del - self.iw);
-        }
+    /// `_ir = _iw - del; if (_ir < 0) _ir += _size;` amont. Un `del` négatif (pré-retard < 20 ms, hors de
+    /// la plage 20–80 ms du paramètre) place la lecture en avant de l'écriture; l'amont sortirait alors du
+    /// tampon (comportement indéfini), ici on replie modulo la taille.
+    fn set_delay(&mut self, del: i64) {
+        let size = self.size as i64;
+        let mut ir = self.iw as i64 - del;
+        if ir < 0 { ir += size; }
+        self.ir = ir.rem_euclid(size) as usize;
     }
 
     #[inline]
@@ -233,7 +274,7 @@ pub struct ZitaReverb {
     delay: [RevDelay; 8],
 
     /// Output EQ
-    pareq: [BiquadEQ; 2],
+    pareq: [OutputEq; 2],
 
     /// Dirty flags for parameter recalculation
     a_dirty: bool,
@@ -271,10 +312,10 @@ impl ZitaReverb {
         let mut reverb = Self {
             sample_rate,
             vdelay: [Vdelay::new(), Vdelay::new()],
-            diff1: core::array::from_fn(|_| Diff1::new()),
+            diff1: core::array::from_fn(|i| Diff1::new((TDIFF1[i] * MAX_SAMPLE_RATE) as usize + 2)),
             filt1: core::array::from_fn(|_| Filt1::new()),
-            delay: core::array::from_fn(|_| RevDelay::new()),
-            pareq: [BiquadEQ::new(sample_rate), BiquadEQ::new(sample_rate)],
+            delay: core::array::from_fn(|i| RevDelay::new(((TDELAY[i] - TDIFF1[i]) * MAX_SAMPLE_RATE) as usize + 2)),
+            pareq: [OutputEq::new(sample_rate), OutputEq::new(sample_rate)],
             a_dirty: true,
             b_dirty: true,
             c_dirty: true,
@@ -288,11 +329,6 @@ impl ZitaReverb {
             g1: 0.0,
         };
 
-        // Initialize EQ
-        reverb.pareq[0].set_q(REVERB_EQ_Q_DEFAULT);
-        reverb.pareq[1].set_q(REVERB_EQ_Q_DEFAULT);
-        reverb.pareq[0].set_freq(1000.0);
-        reverb.pareq[1].set_freq(1000.0);
 
         reverb.init_delay_lines();
         reverb.prepare();
@@ -302,7 +338,7 @@ impl ZitaReverb {
 
     /// Initialize delay lines based on sample rate
     fn init_delay_lines(&mut self) {
-        // Variable delays for input
+        assert!(self.sample_rate > 0.0 && self.sample_rate <= MAX_SAMPLE_RATE);
         let vdelay_size = (0.1 * self.sample_rate) as usize;
         self.vdelay[0].init(vdelay_size);
         self.vdelay[1].init(vdelay_size);
@@ -330,20 +366,22 @@ impl ZitaReverb {
     }
 
     /// Prepare parameters for processing
+    #[allow(clippy::approx_constant)] // 6.2832f amont, volontairement différent de TAU
     fn prepare(&mut self) {
         if self.a_dirty {
-            let k = ((self.ipdel - 0.020) * self.sample_rate + 0.5) as usize;
-            self.vdelay[0].set_delay(k.min(self.vdelay[0].size.saturating_sub(1)));
-            self.vdelay[1].set_delay(k.min(self.vdelay[1].size.saturating_sub(1)));
+            let k = libm::floorf((self.ipdel - 0.020) * self.sample_rate + 0.5) as i64;
+            self.vdelay[0].set_delay(k);
+            self.vdelay[1].set_delay(k);
             self.a_dirty = false;
         }
 
         if self.b_dirty {
-            let wlo = 6.2832 * self.xover / self.sample_rate;
+            // ZitaReverb.cpp:234-238 utilise la constante float 6.2832f, pas 2π.
+            let wlo = 6.2832_f32 * self.xover / self.sample_rate;
             let chi = if self.fdamp > 0.49 * self.sample_rate {
                 2.0
             } else {
-                1.0 - libm::cosf(6.2832 * self.fdamp / self.sample_rate)
+                1.0 - libm::cosf(6.2832_f32 * self.fdamp / self.sample_rate)
             };
 
             for i in 0..8 {
@@ -368,28 +406,28 @@ impl ZitaReverb {
 
     /// Set pre-delay in seconds
     pub fn set_delay(&mut self, v: f32) {
-        self.ipdel = v.clamp(0.02, 0.1);
+        self.ipdel = v;
         self.a_dirty = true;
         self.prepare();
     }
 
     /// Set low frequency crossover in Hz
     pub fn set_xover(&mut self, v: f32) {
-        self.xover = v.clamp(50.0, 1000.0);
+        self.xover = v;
         self.b_dirty = true;
         self.prepare();
     }
 
     /// Set low frequency RT60 in seconds
     pub fn set_rtlow(&mut self, v: f32) {
-        self.rtlow = v.clamp(0.5, 10.0);
-        self.b_dirty = true;
+        self.rtlow = v;
+        self.c_dirty = true;
         self.prepare();
     }
 
     /// Set mid frequency RT60 in seconds
     pub fn set_rtmid(&mut self, v: f32) {
-        self.rtmid = v.clamp(0.5, 10.0);
+        self.rtmid = v;
         self.b_dirty = true;
         self.c_dirty = true;
         self.prepare();
@@ -397,14 +435,14 @@ impl ZitaReverb {
 
     /// Set damping frequency in Hz
     pub fn set_fdamp(&mut self, v: f32) {
-        self.fdamp = v.clamp(1000.0, 20000.0);
+        self.fdamp = v;
         self.b_dirty = true;
         self.prepare();
     }
 
     /// Set dry/wet mix (0.0 = dry, 1.0 = wet)
     pub fn set_mix(&mut self, v: f32) {
-        self.opmix = v.clamp(0.0, 1.0);
+        self.opmix = v;
         self.c_dirty = true;
         self.prepare();
     }
@@ -432,8 +470,6 @@ impl ZitaReverb {
             self.delay[i].reset();
         }
 
-        self.pareq[0].reset();
-        self.pareq[1].reset();
     }
 
     /// Process stereo input

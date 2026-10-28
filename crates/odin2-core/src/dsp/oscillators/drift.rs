@@ -163,7 +163,7 @@ mod tests {
             let output = drift.process();
             assert!(output.is_finite(), "Drift produced invalid output");
             assert!(
-                output >= -1.0 && output <= 1.0,
+                (-1.0..=1.0).contains(&output),
                 "Drift out of range: {}",
                 output
             );
@@ -204,7 +204,7 @@ mod tests {
         for _ in 0..44100 {
             let output = drift.process();
             assert!(
-                output >= -0.5 && output <= 0.5,
+                (-0.5..=0.5).contains(&output),
                 "Drift with amount 0.5 out of range: {}",
                 output
             );
