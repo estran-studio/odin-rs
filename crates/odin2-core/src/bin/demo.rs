@@ -21,14 +21,14 @@ use std::process::Command;
 
 use hound::{WavSpec, WavWriter};
 
-use odin2_core::constants::FILTER_ENV_MODULATION_HZ;
 use odin2_core::dsp::effects::{Chorus, Delay, ZitaReverb};
 use odin2_core::dsp::envelopes::{Adsr, Envelope};
 use odin2_core::dsp::filters::{Filter, LadderFilter, LadderFilterType};
 use odin2_core::dsp::oscillators::{
     AnalogOscillator, MultiOscillator, Oscillator, WavetableOsc2D, WavetableOscillator, Waveform,
 };
-use odin2_core::preset::{OdinPreset, OscillatorType, FilterType};
+use odin2_core::preset::OdinPreset;
+use odin2_core::{OdinEngine, SynthEngine};
 
 const SAMPLE_RATE: u32 = 44100;
 
@@ -517,12 +517,12 @@ fn generate_pad_reverb(melody: &Melody, samples: &mut [f32]) {
 
         env.trigger();
 
-        for i in start_sample..total_end.min(num_samples) {
+        for (i, d) in dry.iter_mut().enumerate().take(total_end.min(num_samples)).skip(start_sample) {
             if i == release_sample {
                 env.release();
             }
             let env_val = env.process();
-            dry[i] += osc.process() * env_val * 0.2;
+            *d += osc.process() * env_val * 0.2;
         }
     }
 
@@ -683,7 +683,7 @@ fn print_factory_list() {
             if let Ok(files) = fs::read_dir(entry.path()) {
                 let mut presets: Vec<_> = files
                     .flatten()
-                    .filter(|f| f.path().extension().map_or(false, |ext| ext == "odin"))
+                    .filter(|f| f.path().extension().is_some_and(|ext| ext == "odin"))
                     .collect();
                 presets.sort_by_key(|f| f.file_name());
 
@@ -712,7 +712,7 @@ fn find_factory_preset(name: &str) -> Option<std::path::PathBuf> {
             if entry.path().is_dir() {
                 if let Ok(files) = fs::read_dir(entry.path()) {
                     for file in files.flatten() {
-                        if file.path().extension().map_or(false, |ext| ext == "odin") {
+                        if file.path().extension().is_some_and(|ext| ext == "odin") {
                             let preset_name = file.path().file_stem()
                                 .map(|s| s.to_string_lossy().to_string().to_lowercase())
                                 .unwrap_or_default();
@@ -730,270 +730,30 @@ fn find_factory_preset(name: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Generate audio from an OdinPreset
+/// Rendu d'un patch complet par le même moteur que l'hôte.
 fn generate_from_odin_preset(preset: &OdinPreset, melody: &Melody) -> Vec<f32> {
     let sr = SAMPLE_RATE as f32;
-    let num_samples = (sr * melody.duration) as usize;
-    let mut samples = vec![0.0f32; num_samples * 2];
-
-    // Determine oscillator type based on preset
-    let osc_type = preset.osc1.osc_type;
-
-    for &(note, start, dur) in melody.notes {
-        let freq = midi_to_freq(note);
-
-        match osc_type {
-            OscillatorType::Analog => {
-                generate_odin_analog(preset, freq, start, dur, sr, &mut samples);
-            }
-            OscillatorType::Wavetable => {
-                generate_odin_wavetable(preset, freq, start, dur, sr, &mut samples);
-            }
-            OscillatorType::Multi => {
-                generate_odin_multi(preset, freq, start, dur, sr, &mut samples);
-            }
-            _ => {
-                // Fallback to analog for other types
-                generate_odin_analog(preset, freq, start, dur, sr, &mut samples);
-            }
-        }
+    let frames = (sr * melody.duration) as usize;
+    let mut samples = vec![0.0; frames * 2];
+    let mut engine = OdinEngine::new(sr);
+    engine.load_preset(preset).expect("Matrice de modulation du preset invalide");
+    let mut events = Vec::with_capacity(melody.notes.len() * 2);
+    for &(note, start, duration) in melody.notes {
+        events.push(((start * sr) as usize, true, note));
+        events.push((((start + duration) * sr) as usize, false, note));
     }
-
-    // Apply effects if enabled
-    apply_odin_effects(preset, &mut samples);
-
+    events.sort_by_key(|&(at, on, _)| (at, on));
+    let mut cursor = 0;
+    for (at, on, note) in events {
+        let at = at.min(frames);
+        engine.process(&mut samples[cursor * 2..at * 2], 2);
+        if on { engine.note_on(note, 100); } else { engine.note_off(note); }
+        cursor = at;
+    }
+    engine.process(&mut samples[cursor * 2..], 2);
     samples
 }
 
-fn generate_odin_analog(preset: &OdinPreset, freq: f32, start: f32, dur: f32, sr: f32, samples: &mut [f32]) {
-    let num_samples = samples.len() / 2;
-
-    let mut osc = AnalogOscillator::new(sr);
-    let waveform = match preset.osc1.analog_wave {
-        odin2_core::preset::AnalogWaveform::Saw => Waveform::Saw,
-        odin2_core::preset::AnalogWaveform::Pulse => Waveform::Square,
-        odin2_core::preset::AnalogWaveform::Triangle => Waveform::Triangle,
-        odin2_core::preset::AnalogWaveform::Sine => Waveform::Sine,
-    };
-    osc.set_waveform(waveform);
-    osc.set_frequency(freq);
-
-    // Use preset envelope settings
-    let mut env = Adsr::new(sr);
-    env.set_attack(preset.env1.attack.max(0.001));
-    env.set_decay(preset.env1.decay.max(0.001));
-    env.set_sustain(preset.env1.sustain);
-    env.set_release(preset.env1.release.max(0.01));
-
-    // Optional filter
-    let mut filter = LadderFilter::new(sr);
-    let use_filter = preset.filter1.frequency < 19000.0;
-    if use_filter {
-        filter.set_filter_type(match preset.filter1.filter_type {
-            FilterType::LP24 => LadderFilterType::LP4,
-            FilterType::LP12 => LadderFilterType::LP2,
-            FilterType::BP24 => LadderFilterType::BP4,
-            FilterType::BP12 => LadderFilterType::BP2,
-            FilterType::HP24 => LadderFilterType::HP4,
-            FilterType::HP12 => LadderFilterType::HP2,
-            _ => LadderFilterType::LP4,
-        });
-        filter.set_cutoff(preset.filter1.frequency);
-        filter.set_resonance(preset.filter1.resonance);
-    }
-
-    let mut filter_env = Adsr::new(sr);
-    filter_env.set_attack(preset.env2.attack.max(0.001));
-    filter_env.set_decay(preset.env2.decay.max(0.001));
-    filter_env.set_sustain(preset.env2.sustain);
-    filter_env.set_release(preset.env2.release.max(0.01));
-
-    let start_sample = (start * sr) as usize;
-    let release_sample = ((start + dur) * sr) as usize;
-    let total_end = ((start + dur + preset.env1.release + 0.1) * sr) as usize;
-
-    env.trigger();
-    filter_env.trigger();
-
-    let volume = if preset.osc1.volume > 0.0 { preset.osc1.volume } else { 0.8 };
-
-    for i in start_sample..total_end.min(num_samples) {
-        if i == release_sample {
-            env.release();
-            filter_env.release();
-        }
-
-        let env_val = env.process();
-        let mut out = osc.process();
-
-        if use_filter {
-            let filter_env_val = filter_env.process();
-            let mod_cutoff = preset.filter1.frequency + filter_env_val * preset.filter1.env_amount * FILTER_ENV_MODULATION_HZ;
-            filter.set_cutoff(mod_cutoff.clamp(20.0, 20000.0));
-            out = filter.process(out);
-        }
-
-        out *= env_val * volume * 0.3;
-        samples[i * 2] += out;
-        samples[i * 2 + 1] += out;
-    }
-}
-
-fn generate_odin_wavetable(preset: &OdinPreset, freq: f32, start: f32, dur: f32, sr: f32, samples: &mut [f32]) {
-    let num_samples = samples.len() / 2;
-
-    let mut osc = WavetableOscillator::new(sr);
-    osc.set_wavetable(preset.osc1.wavetable as usize);
-    osc.set_frequency(freq);
-
-    let mut env = Adsr::new(sr);
-    env.set_attack(preset.env1.attack.max(0.001));
-    env.set_decay(preset.env1.decay.max(0.001));
-    env.set_sustain(preset.env1.sustain);
-    env.set_release(preset.env1.release.max(0.01));
-
-    let start_sample = (start * sr) as usize;
-    let release_sample = ((start + dur) * sr) as usize;
-    let total_end = ((start + dur + preset.env1.release + 0.1) * sr) as usize;
-
-    env.trigger();
-
-    let volume = if preset.osc1.volume > 0.0 { preset.osc1.volume } else { 0.8 };
-
-    for i in start_sample..total_end.min(num_samples) {
-        if i == release_sample {
-            env.release();
-        }
-
-        let env_val = env.process();
-        let out = osc.process() * env_val * volume * 0.3;
-        samples[i * 2] += out;
-        samples[i * 2 + 1] += out;
-    }
-}
-
-fn generate_odin_multi(preset: &OdinPreset, freq: f32, start: f32, dur: f32, sr: f32, samples: &mut [f32]) {
-    let num_samples = samples.len() / 2;
-
-    let mut osc = MultiOscillator::new(sr);
-    osc.set_wavetable(preset.osc1.wavetable as usize);
-    osc.set_frequency(freq);
-    osc.set_detune(preset.osc1.detune);
-    osc.set_stereo_width(preset.osc1.spread);
-    osc.randomize_phase();
-
-    let mut env = Adsr::new(sr);
-    env.set_attack(preset.env1.attack.max(0.001));
-    env.set_decay(preset.env1.decay.max(0.001));
-    env.set_sustain(preset.env1.sustain);
-    env.set_release(preset.env1.release.max(0.01));
-
-    // Optional filter
-    let mut filter = LadderFilter::new(sr);
-    let use_filter = preset.filter1.frequency < 19000.0;
-    if use_filter {
-        filter.set_filter_type(match preset.filter1.filter_type {
-            FilterType::LP24 => LadderFilterType::LP4,
-            FilterType::LP12 => LadderFilterType::LP2,
-            FilterType::BP24 => LadderFilterType::BP4,
-            FilterType::BP12 => LadderFilterType::BP2,
-            FilterType::HP24 => LadderFilterType::HP4,
-            FilterType::HP12 => LadderFilterType::HP2,
-            _ => LadderFilterType::LP4,
-        });
-        filter.set_cutoff(preset.filter1.frequency);
-        filter.set_resonance(preset.filter1.resonance);
-    }
-
-    let mut filter_env = Adsr::new(sr);
-    filter_env.set_attack(preset.env2.attack.max(0.001));
-    filter_env.set_decay(preset.env2.decay.max(0.001));
-    filter_env.set_sustain(preset.env2.sustain);
-    filter_env.set_release(preset.env2.release.max(0.01));
-
-    let start_sample = (start * sr) as usize;
-    let release_sample = ((start + dur) * sr) as usize;
-    let total_end = ((start + dur + preset.env1.release + 0.1) * sr) as usize;
-
-    env.trigger();
-    filter_env.trigger();
-
-    let volume = if preset.osc1.volume > 0.0 { preset.osc1.volume } else { 0.8 };
-
-    for i in start_sample..total_end.min(num_samples) {
-        if i == release_sample {
-            env.release();
-            filter_env.release();
-        }
-
-        let env_val = env.process();
-        let (mut left, mut right) = osc.process_stereo();
-
-        if use_filter {
-            let filter_env_val = filter_env.process();
-            let mod_cutoff = preset.filter1.frequency + filter_env_val * preset.filter1.env_amount * FILTER_ENV_MODULATION_HZ;
-            filter.set_cutoff(mod_cutoff.clamp(20.0, 20000.0));
-            left = filter.process(left);
-            right = filter.process(right);
-        }
-
-        samples[i * 2] += left * env_val * volume * 0.25;
-        samples[i * 2 + 1] += right * env_val * volume * 0.25;
-    }
-}
-
-fn apply_odin_effects(preset: &OdinPreset, samples: &mut [f32]) {
-    let sr = SAMPLE_RATE as f32;
-    let num_samples = samples.len() / 2;
-
-    // Apply chorus if enabled
-    if preset.chorus.on {
-        let mut chorus = Chorus::new(sr);
-        chorus.set_amount(preset.chorus.amount);
-        chorus.set_dry_wet(preset.chorus.dry_wet);
-        chorus.set_lfo_freq(preset.chorus.rate);
-
-        for i in 0..num_samples {
-            let mono = (samples[i * 2] + samples[i * 2 + 1]) * 0.5;
-            let (left, right) = chorus.process(mono);
-            samples[i * 2] = left;
-            samples[i * 2 + 1] = right;
-        }
-    }
-
-    // Apply delay if enabled
-    if preset.delay.on {
-        let mut delay = Delay::new(sr);
-        delay.set_delay_time(preset.delay.time);
-        delay.set_feedback(preset.delay.feedback);
-        delay.set_wet(preset.delay.wet);
-        delay.set_dry(preset.delay.dry);
-
-        for i in 0..num_samples {
-            let (left, right) = delay.process(samples[i * 2], samples[i * 2 + 1]);
-            samples[i * 2] = left;
-            samples[i * 2 + 1] = right;
-        }
-    }
-
-    // Apply reverb if enabled
-    if preset.reverb.on {
-        let mut reverb = ZitaReverb::new(sr);
-        reverb.set_mix(preset.reverb.dry_wet);
-
-        for i in 0..num_samples {
-            let (left, right) = reverb.process(samples[i * 2], samples[i * 2 + 1]);
-            samples[i * 2] = left;
-            samples[i * 2 + 1] = right;
-        }
-    }
-
-    // Apply master volume
-    let master = if preset.master > 0.0 { preset.master } else { 0.8 };
-    for sample in samples.iter_mut() {
-        *sample *= master;
-    }
-}
 
 fn main() {
     let args: Vec<String> = env::args().collect();

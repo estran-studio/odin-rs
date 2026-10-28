@@ -1,10 +1,10 @@
 [package]
 name = "odin2-core"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Odin 2 synthesizer core DSP engine in Rust"
-license = "GPL-3.0"
-repository = "https://github.com/bascanada/odin2-rs"
+license.workspace = true
+repository.workspace = true
 
 [lib]
 crate-type = ["lib"]
@@ -19,14 +19,25 @@ name = "morph-demo"
 path = "src/bin/morph_demo.rs"
 required-features = ["std"]
 
+[[example]]
+name = "audit_presets"
+required-features = ["std"]
+
+[[example]]
+name = "preset_morph"
+required-features = ["std"]
+
+[[example]]
+name = "fidelity_render"
+required-features = ["std"]
+
 [features]
 default = []
 std = ["hound"]
 
 [dependencies]
-libm = "0.2"
-wide = "0.7"
-hound = { version = "3.5", optional = true }
+libm.workspace = true
+hound = { workspace = true, optional = true }
 
 [dev-dependencies]
-hound = "3.5"
+hound.workspace = true

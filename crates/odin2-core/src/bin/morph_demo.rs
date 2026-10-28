@@ -13,11 +13,7 @@ use std::process::Command;
 
 use hound::{WavSpec, WavWriter};
 
-use odin2_core::constants::FILTER_ENV_MODULATION_HZ;
-use odin2_core::dsp::effects::{Chorus, Delay, ZitaReverb};
-use odin2_core::dsp::envelopes::{Adsr, Envelope};
-use odin2_core::dsp::filters::{Filter, LadderFilter, LadderFilterType};
-use odin2_core::dsp::oscillators::MultiOscillator;
+use odin2_core::{EngineConfig, OdinEngine, ParameterId, SynthEngine};
 use odin2_core::preset::OdinPreset;
 
 const SAMPLE_RATE: u32 = 44100;
@@ -119,129 +115,11 @@ const MELODIES: &[Melody] = &[
 const FACTORY_PRESETS_PATH: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../odin2/assets/Soundbanks/Factory Presets");
 
-/// Interpolated preset parameters for real-time morphing
-#[derive(Clone)]
-struct MorphedParams {
-    // Oscillator
-    osc_detune: f32,
-    osc_spread: f32,
-
-    // Filter
-    filter_freq: f32,
-    filter_res: f32,
-    filter_env_amount: f32,
-
-    // Amp envelope
-    amp_attack: f32,
-    amp_decay: f32,
-    amp_sustain: f32,
-    amp_release: f32,
-
-    // Filter envelope
-    fil_attack: f32,
-    fil_decay: f32,
-    fil_sustain: f32,
-    fil_release: f32,
-
-    // Effects
-    chorus_amount: f32,
-    chorus_rate: f32,
-    chorus_mix: f32,
-
-    delay_time: f32,
-    delay_feedback: f32,
-    delay_mix: f32,
-
-    reverb_mix: f32,
-
-    // Master
-    master: f32,
-}
-
-impl MorphedParams {
-    fn from_preset(preset: &OdinPreset) -> Self {
-        Self {
-            osc_detune: preset.osc1.detune,
-            osc_spread: preset.osc1.spread,
-
-            filter_freq: preset.filter1.frequency,
-            filter_res: preset.filter1.resonance,
-            filter_env_amount: preset.filter1.env_amount,
-
-            amp_attack: preset.env1.attack.max(0.001),
-            amp_decay: preset.env1.decay.max(0.001),
-            amp_sustain: preset.env1.sustain,
-            amp_release: preset.env1.release.max(0.01),
-
-            fil_attack: preset.env2.attack.max(0.001),
-            fil_decay: preset.env2.decay.max(0.001),
-            fil_sustain: preset.env2.sustain,
-            fil_release: preset.env2.release.max(0.01),
-
-            chorus_amount: if preset.chorus.on { preset.chorus.amount } else { 0.0 },
-            chorus_rate: preset.chorus.rate,
-            chorus_mix: if preset.chorus.on { preset.chorus.dry_wet } else { 0.0 },
-
-            delay_time: preset.delay.time,
-            delay_feedback: preset.delay.feedback,
-            delay_mix: if preset.delay.on { preset.delay.wet } else { 0.0 },
-
-            reverb_mix: if preset.reverb.on { preset.reverb.dry_wet } else { 0.0 },
-
-            master: if preset.master > 0.0 { preset.master } else { 0.7 },
-        }
-    }
-
-    /// Linear interpolation between two parameter sets
-    fn lerp(a: &Self, b: &Self, t: f32) -> Self {
-        let t = t.clamp(0.0, 1.0);
-        let inv_t = 1.0 - t;
-
-        Self {
-            osc_detune: a.osc_detune * inv_t + b.osc_detune * t,
-            osc_spread: a.osc_spread * inv_t + b.osc_spread * t,
-
-            filter_freq: a.filter_freq * inv_t + b.filter_freq * t,
-            filter_res: a.filter_res * inv_t + b.filter_res * t,
-            filter_env_amount: a.filter_env_amount * inv_t + b.filter_env_amount * t,
-
-            amp_attack: a.amp_attack * inv_t + b.amp_attack * t,
-            amp_decay: a.amp_decay * inv_t + b.amp_decay * t,
-            amp_sustain: a.amp_sustain * inv_t + b.amp_sustain * t,
-            amp_release: a.amp_release * inv_t + b.amp_release * t,
-
-            fil_attack: a.fil_attack * inv_t + b.fil_attack * t,
-            fil_decay: a.fil_decay * inv_t + b.fil_decay * t,
-            fil_sustain: a.fil_sustain * inv_t + b.fil_sustain * t,
-            fil_release: a.fil_release * inv_t + b.fil_release * t,
-
-            chorus_amount: a.chorus_amount * inv_t + b.chorus_amount * t,
-            chorus_rate: a.chorus_rate * inv_t + b.chorus_rate * t,
-            chorus_mix: a.chorus_mix * inv_t + b.chorus_mix * t,
-
-            delay_time: a.delay_time * inv_t + b.delay_time * t,
-            delay_feedback: a.delay_feedback * inv_t + b.delay_feedback * t,
-            delay_mix: a.delay_mix * inv_t + b.delay_mix * t,
-
-            reverb_mix: a.reverb_mix * inv_t + b.reverb_mix * t,
-
-            master: a.master * inv_t + b.master * t,
-        }
-    }
-
-    /// Smooth interpolation (ease in/out) between two parameter sets
-    fn smooth_lerp(a: &Self, b: &Self, t: f32) -> Self {
-        // Smoothstep function for smoother transitions
-        let t = t.clamp(0.0, 1.0);
-        let smooth_t = t * t * (3.0 - 2.0 * t);
-        Self::lerp(a, b, smooth_t)
-    }
-}
 
 /// Morph sequence definition
 struct MorphSequence {
     presets: Vec<OdinPreset>,
-    params: Vec<MorphedParams>,
+    params: Vec<EngineConfig>,
     durations: Vec<f32>, // Duration for each morph transition in seconds
 }
 
@@ -255,11 +133,8 @@ impl MorphSequence {
     }
 
     fn add_preset(&mut self, preset: OdinPreset, transition_duration: f32) {
-        self.params.push(MorphedParams::from_preset(&preset));
+        self.params.push(EngineConfig::from_preset(&preset));
         self.presets.push(preset);
-        if self.durations.len() < self.params.len() - 1 {
-            // Duration for morphing FROM previous TO this preset
-        }
         if !self.durations.is_empty() || self.params.len() > 1 {
             self.durations.push(transition_duration);
         }
@@ -269,32 +144,27 @@ impl MorphSequence {
         self.durations.iter().sum()
     }
 
-    /// Get interpolated parameters at a given time
-    fn get_params_at(&self, time: f32) -> MorphedParams {
-        if self.params.is_empty() {
-            return MorphedParams::from_preset(&OdinPreset::default());
-        }
-        if self.params.len() == 1 {
-            return self.params[0].clone();
-        }
-
-        let mut accumulated_time = 0.0;
-        for (i, &duration) in self.durations.iter().enumerate() {
-            if time < accumulated_time + duration {
-                let local_t = (time - accumulated_time) / duration;
-                return MorphedParams::smooth_lerp(&self.params[i], &self.params[i + 1], local_t);
+    /// Interpolation du catalogue entier ; topologie du preset le plus proche.
+    fn get_params_at(&self, time: f32) -> (EngineConfig, usize) {
+        for (index, &duration) in self.durations.iter().enumerate() {
+            let begin: f32 = self.durations[..index].iter().sum();
+            if time < begin + duration {
+                let t = ((time - begin) / duration).clamp(0.0, 1.0);
+                let t = t * t * (3.0 - 2.0 * t);
+                let topology = if t < 0.5 { index } else { index + 1 };
+                let mut config = self.params[topology];
+                for parameter in ParameterId::all() {
+                    let a = parameter.get(&self.params[index]);
+                    let b = parameter.get(&self.params[index + 1]);
+                    parameter.set(&mut config, a + (b - a) * t).expect("Paramètre interpolé invalide");
+                }
+                return (config, topology);
             }
-            accumulated_time += duration;
         }
-
-        // Return last preset params if past all transitions
-        self.params.last().unwrap().clone()
+        (*self.params.last().expect("Séquence de presets vide"), self.params.len() - 1)
     }
 }
 
-fn midi_to_freq(note: u8) -> f32 {
-    440.0 * libm::powf(2.0, (note as f32 - 69.0) / 12.0)
-}
 
 fn find_factory_preset(name: &str) -> Option<std::path::PathBuf> {
     let base_path = Path::new(FACTORY_PRESETS_PATH);
@@ -309,7 +179,7 @@ fn find_factory_preset(name: &str) -> Option<std::path::PathBuf> {
             if entry.path().is_dir() {
                 if let Ok(files) = fs::read_dir(entry.path()) {
                     for file in files.flatten() {
-                        if file.path().extension().map_or(false, |ext| ext == "odin") {
+                        if file.path().extension().is_some_and(|ext| ext == "odin") {
                             let preset_name = file
                                 .path()
                                 .file_stem()
@@ -336,216 +206,50 @@ fn load_preset(name: &str) -> Option<OdinPreset> {
     })
 }
 
-/// Voice state for polyphonic rendering
-struct Voice {
-    osc: MultiOscillator,
-    filter: LadderFilter,
-    amp_env: Adsr,
-    filter_env: Adsr,
-    note: u8,
-    active: bool,
-    start_sample: usize,
-    release_sample: usize,
-}
-
-impl Voice {
-    fn new(sr: f32) -> Self {
-        Self {
-            osc: MultiOscillator::new(sr),
-            filter: LadderFilter::new(sr),
-            amp_env: Adsr::new(sr),
-            filter_env: Adsr::new(sr),
-            note: 0,
-            active: false,
-            start_sample: 0,
-            release_sample: 0,
-        }
-    }
-
-    fn note_on(&mut self, note: u8, start_sample: usize, duration_samples: usize, params: &MorphedParams) {
-        self.note = note;
-        self.osc.set_frequency(midi_to_freq(note));
-        self.osc.set_wavetable(1);
-        self.osc.randomize_phase();
-
-        // Set envelope from morphed params
-        self.amp_env.set_attack(params.amp_attack);
-        self.amp_env.set_decay(params.amp_decay);
-        self.amp_env.set_sustain(params.amp_sustain);
-        self.amp_env.set_release(params.amp_release);
-        self.amp_env.trigger();
-
-        self.filter_env.set_attack(params.fil_attack);
-        self.filter_env.set_decay(params.fil_decay);
-        self.filter_env.set_sustain(params.fil_sustain);
-        self.filter_env.set_release(params.fil_release);
-        self.filter_env.trigger();
-
-        self.active = true;
-        self.start_sample = start_sample;
-        self.release_sample = start_sample + duration_samples;
-    }
-
-    fn process(&mut self, params: &MorphedParams) -> (f32, f32) {
-        if !self.active {
-            return (0.0, 0.0);
-        }
-
-        // Update oscillator with morphed params
-        self.osc.set_detune(params.osc_detune);
-        self.osc.set_stereo_width(params.osc_spread);
-
-        // Update filter with morphed params + envelope
-        let filter_env_val = self.filter_env.process();
-        let mod_cutoff = params.filter_freq + filter_env_val * params.filter_env_amount * FILTER_ENV_MODULATION_HZ;
-        self.filter.set_cutoff(mod_cutoff.clamp(20.0, 20000.0));
-        self.filter.set_resonance(params.filter_res);
-        self.filter.set_filter_type(LadderFilterType::LP4);
-
-        let amp_env_val = self.amp_env.process();
-
-        // Check if voice finished
-        if amp_env_val < 0.0001 && !self.amp_env.is_active() {
-            self.active = false;
-            return (0.0, 0.0);
-        }
-
-        let (l, r) = self.osc.process_stereo();
-        let filtered_l = self.filter.process(l);
-        let filtered_r = self.filter.process(r);
-
-        (filtered_l * amp_env_val, filtered_r * amp_env_val)
-    }
-
-    fn check_release(&mut self, current_sample: usize) {
-        if self.active && current_sample >= self.release_sample {
-            self.amp_env.release();
-            self.filter_env.release();
-        }
-    }
-
-    fn is_active(&self) -> bool {
-        self.active
-    }
-}
 
 /// Generate morphing audio with a melody
 fn generate_morph_audio(sequence: &MorphSequence, melody: &Melody) -> Vec<f32> {
     let sr = SAMPLE_RATE as f32;
-    let total_duration = sequence.total_duration();
-    let num_samples = (sr * total_duration) as usize;
-    let mut samples = vec![0.0f32; num_samples * 2];
-
-    println!("  Generating {:.1}s of morphing audio with melody '{}'...", total_duration, melody.name);
-
-    // Voice pool for polyphony
-    const MAX_VOICES: usize = 16;
-    let mut voices: Vec<Voice> = (0..MAX_VOICES).map(|_| Voice::new(sr)).collect();
-
-    // Schedule notes - scale timing to fit morph duration
-    let melody_duration = melody.notes.iter()
-        .map(|&(_, start, dur)| start + dur)
-        .fold(0.0f32, |a, b| a.max(b));
-
-    let time_scale = if melody_duration > 0.0 { total_duration / melody_duration } else { 1.0 };
-
-    // Convert melody to sample-based events
-    let note_events: Vec<(usize, usize, u8)> = melody.notes.iter()
-        .map(|&(note, start, dur)| {
-            let start_sample = (start * time_scale * sr) as usize;
-            let duration_samples = (dur * time_scale * sr) as usize;
-            (start_sample, duration_samples, note)
-        })
-        .collect();
-
-    // Effects
-    let mut chorus = Chorus::new(sr);
-    let mut delay = Delay::new(sr);
-    let mut reverb = ZitaReverb::new(sr);
-
-    // Process each sample
-    for i in 0..num_samples {
-        let time = i as f32 / sr;
-        let params = sequence.get_params_at(time);
-
-        // Trigger new notes
-        for &(start_sample, duration_samples, note) in &note_events {
-            if i == start_sample {
-                // Find free voice
-                if let Some(voice) = voices.iter_mut().find(|v| !v.is_active()) {
-                    voice.note_on(note, start_sample, duration_samples, &params);
-                }
-            }
-        }
-
-        // Check for note releases
-        for voice in &mut voices {
-            voice.check_release(i);
-        }
-
-        // Update effects with morphed parameters
-        chorus.set_amount(params.chorus_amount);
-        chorus.set_lfo_freq(params.chorus_rate.max(0.1));
-        chorus.set_dry_wet(params.chorus_mix);
-
-        delay.set_delay_time(params.delay_time.max(0.01));
-        delay.set_feedback(params.delay_feedback);
-        delay.set_wet(params.delay_mix);
-        delay.set_dry(1.0 - params.delay_mix * 0.5);
-
-        reverb.set_mix(params.reverb_mix);
-
-        // Generate and mix all active voices
-        let mut left = 0.0f32;
-        let mut right = 0.0f32;
-        let mut active_count = 0;
-
-        for voice in &mut voices {
-            if voice.is_active() {
-                let (l, r) = voice.process(&params);
-                left += l;
-                right += r;
-                active_count += 1;
-            }
-        }
-
-        // Normalize by active voice count
-        if active_count > 0 {
-            let voice_scale = 1.0 / (active_count as f32).sqrt();
-            left *= voice_scale;
-            right *= voice_scale;
-        }
-
-        // Apply chorus
-        if params.chorus_mix > 0.01 {
-            let mono = (left + right) * 0.5;
-            let (cl, cr) = chorus.process(mono);
-            left = left * (1.0 - params.chorus_mix) + cl * params.chorus_mix;
-            right = right * (1.0 - params.chorus_mix) + cr * params.chorus_mix;
-        }
-
-        // Apply delay
-        if params.delay_mix > 0.01 {
-            let (dl, dr) = delay.process(left, right);
-            left = dl;
-            right = dr;
-        }
-
-        // Apply reverb
-        if params.reverb_mix > 0.01 {
-            let (rl, rr) = reverb.process(left, right);
-            left = rl;
-            right = rr;
-        }
-
-        // Master volume
-        left *= params.master * 0.4;
-        right *= params.master * 0.4;
-
-        samples[i * 2] = left;
-        samples[i * 2 + 1] = right;
+    let duration = sequence.total_duration();
+    let frames = (sr * duration) as usize;
+    let mut samples = vec![0.0; frames * 2];
+    let mut engine = OdinEngine::new(sr);
+    engine.load_config(sequence.params[0]).expect("Preset initial invalide");
+    let melody_duration = melody.notes.iter().map(|&(_, start, length)| start + length).fold(0.0_f32, f32::max);
+    let scale = duration / melody_duration;
+    let mut events = Vec::with_capacity(melody.notes.len() * 2);
+    for &(note, start, length) in melody.notes {
+        events.push(((start * scale * sr) as usize, true, note));
+        events.push((((start + length) * scale * sr) as usize, false, note));
     }
-
+    events.sort_by_key(|&(at, on, _)| (at, on));
+    let mut values: Vec<_> = ParameterId::all().map(|id| (id, 0.0)).collect();
+    let mut event = 0;
+    let mut held = [false; 128];
+    let mut topology = 0;
+    for i in 0..frames {
+        // Cette démo est un rendu hors ligne. Aucune seconde implémentation DSP.
+        if i % 64 == 0 {
+            let (config, next_topology) = sequence.get_params_at(i as f32 / sr);
+            if next_topology != topology {
+                engine.load_config(config).expect("Preset interpolé invalide");
+                for (note, &active) in held.iter().enumerate() {
+                    if active { engine.note_on(note as u8, 100); }
+                }
+                topology = next_topology;
+            } else {
+                for (id, value) in &mut values { *value = id.get(&config); }
+                engine.set_parameters(&values).expect("Paramètres interpolés invalides");
+            }
+        }
+        while event < events.len() && events[event].0 <= i {
+            let (_, on, note) = events[event];
+            held[note as usize] = on;
+            if on { engine.note_on(note, 100); } else { engine.note_off(note); }
+            event += 1;
+        }
+        engine.process(&mut samples[i * 2..i * 2 + 2], 2);
+    }
     samples
 }
 

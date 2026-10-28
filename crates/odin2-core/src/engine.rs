@@ -1,367 +1,361 @@
-//! Synth Engine - polyphonic voice management
+//! Moteur polyphonique : ordre de traitement de PluginProcessorProcess.cpp.
 
+use alloc::{boxed::Box, rc::Rc, vec::Vec};
+use crate::arpeggiator::Arpeggiator;
+use crate::config::EngineConfig;
+use crate::constants::VOICES;
+use crate::dsp::effects::EffectsChain;
+use crate::dsp::envelopes::{Adsr, Envelope};
+use crate::dsp::filters::PresetFilter;
+use crate::dsp::oscillators::{DrawTableBank, Lfo};
+use crate::mod_matrix::{modulate_gain, GlobalSources, InvalidModulationId, ModMatrix, ModSources, ModulationValues};
+use crate::parameters::{ParameterError, ParameterId};
+use crate::preset::PlayMode;
 use crate::voice::Voice;
-use crate::mod_matrix::ModMatrix;
-use crate::constants::*;
+use crate::voice_manager::{unison, unison_count, VoiceManager};
 
-#[cfg(feature = "std")]
-use crate::preset::OdinPreset;
-
-#[cfg(feature = "std")]
-use crate::dsp::oscillators::Oscillator;
-
-#[cfg(feature = "std")]
-use crate::dsp::filters::Filter;
-
-/// Generic synthesizer engine trait
+/// Interface audio/MIDI, sans allocation dans ses méthodes de rendu et de note.
 pub trait SynthEngine {
-    /// Handle note on event
     fn note_on(&mut self, note: u8, velocity: u8);
-
-    /// Handle note off event
     fn note_off(&mut self, note: u8);
-
-    /// Handle control change
     fn control_change(&mut self, cc: u8, value: u8);
-
-    /// Handle pitch bend
+    /// Déviation signée, -8192 à 8191, centre zéro.
     fn pitch_bend(&mut self, value: i16);
-
-    /// Process audio buffer
+    /// Sortie entrelacée; canaux >2 laissés à zéro, mono = canal gauche upstream.
     fn process(&mut self, output: &mut [f32], channels: usize);
-
-    /// Set sample rate
+    /// Reconfiguration hors callback : certains buffers DSP sont réalloués.
     fn set_sample_rate(&mut self, sample_rate: f32);
 }
 
-/// Voice allocation strategy
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VoiceAllocation {
-    /// Round robin allocation
-    RoundRobin,
-    /// Steal oldest voice
-    StealOldest,
-    /// Steal quietest voice
-    StealQuietest,
-}
-
-/// Simplified preset configuration for engine-level preset loading
-///
-/// This struct extracts essential parameters from an OdinPreset and maps them
-/// to the engine's current capabilities (analog oscillators, basic filters, envelopes).
-#[cfg(feature = "std")]
-#[derive(Debug, Clone)]
-pub struct PresetConfig {
-    // Oscillators (simplified to analog)
-    pub osc_volumes: [f32; 3],
-    pub osc_octaves: [i32; 3],
-    pub osc_semitones: [i32; 3],
-    pub osc_detune: f32,
-
-    // Filter
-    pub filter_frequency: f32,
-    pub filter_resonance: f32,
-    pub filter_env_amount: f32,
-
-    // Amp envelope
-    pub amp_attack: f32,
-    pub amp_decay: f32,
-    pub amp_sustain: f32,
-    pub amp_release: f32,
-
-    // Filter envelope
-    pub filter_attack: f32,
-    pub filter_decay: f32,
-    pub filter_sustain: f32,
-    pub filter_release: f32,
-
-    // Master
-    pub master_volume: f32,
-}
-
-#[cfg(feature = "std")]
-impl PresetConfig {
-    /// Extract essential parameters from an OdinPreset
-    pub fn from_preset(preset: &OdinPreset) -> Self {
-        // Helper to convert dB to linear gain
-        let db_to_lin = |db: f32| {
-            if db <= -100.0 {
-                0.0
-            } else {
-                libm::powf(10.0, db / 20.0)
-            }
-        };
-
-        Self {
-            // Oscillator parameters
-            osc_volumes: [
-                db_to_lin(preset.osc1.volume),
-                db_to_lin(preset.osc2.volume),
-                db_to_lin(preset.osc3.volume),
-            ],
-            osc_octaves: [preset.osc1.octave, preset.osc2.octave, preset.osc3.octave],
-            osc_semitones: [
-                preset.osc1.semitones,
-                preset.osc2.semitones,
-                preset.osc3.semitones,
-            ],
-            osc_detune: preset.osc1.detune,
-
-            // Filter parameters (from filter1)
-            filter_frequency: preset.filter1.frequency.clamp(20.0, 20000.0),
-            filter_resonance: preset.filter1.resonance,
-            filter_env_amount: preset.filter1.env_amount,
-
-            // Amp envelope (env1)
-            amp_attack: preset.env1.attack.max(0.001),
-            amp_decay: preset.env1.decay.max(0.001),
-            amp_sustain: preset.env1.sustain,
-            amp_release: preset.env1.release.max(0.01),
-
-            // Filter envelope (env2)
-            filter_attack: preset.env2.attack.max(0.001),
-            filter_decay: preset.env2.decay.max(0.001),
-            filter_sustain: preset.env2.sustain,
-            filter_release: preset.env2.release.max(0.01),
-
-            // Master volume - convert dB to linear
-            master_volume: db_to_lin(preset.master),
-        }
-    }
-}
-
-/// The main Odin 2 synthesizer engine
 pub struct OdinEngine {
-    /// Polyphonic voices
-    voices: [Voice; VOICES],
-
-    /// Modulation matrix
+    voices: Box<[Voice]>,
     pub mod_matrix: ModMatrix,
-
-    /// Voice allocation strategy
-    allocation: VoiceAllocation,
-
-    /// Next voice index for round-robin
-    next_voice: usize,
-
-    /// Sample rate
+    manager: VoiceManager,
     sample_rate: f32,
-
-    /// Master volume
+    /// Cible linéaire du gain maître, lissée avant la modulation.
     pub master_volume: f32,
-
-    /// Currently active notes (for note-off matching)
-    note_to_voice: [Option<usize>; 128],
-
-    /// Current preset configuration
-    #[cfg(feature = "std")]
-    preset_config: Option<PresetConfig>,
+    master_smooth: f32,
+    config: EngineConfig,
+    filter3: [PresetFilter; 2],
+    effects: EffectsChain,
+    global_env: Adsr,
+    global_lfo: Lfo,
+    globals: GlobalSources,
+    previous_global_mod: ModulationValues,
+    xy_smooth: [f32; 2],
+    last_note: Option<u8>,
+    held_velocity: [u8; 128],
+    held_order: [u8; 128],
+    held_count: usize,
+    arpeggiator: Arpeggiator,
+    voice_unison: [(f32, f32, f32); VOICES],
 }
 
 impl OdinEngine {
-    /// Create a new engine
+    /// Construit tous les états DSP. À appeler hors thread audio.
     pub fn new(sample_rate: f32) -> Self {
-        Self {
-            voices: core::array::from_fn(|_| Voice::new(sample_rate)),
-            mod_matrix: ModMatrix::new(),
-            allocation: VoiceAllocation::RoundRobin,
-            next_voice: 0,
-            sample_rate,
-            master_volume: 1.0,
-            note_to_voice: [None; 128],
-            #[cfg(feature = "std")]
-            preset_config: None,
+        let config = EngineConfig::default();
+        let voice_config = config.voice();
+        let mut voices = Vec::with_capacity(VOICES);
+        for index in 0..VOICES {
+            let mut voice = Voice::new(sample_rate);
+            voice.set_seed(0x4f64_696e_u32.wrapping_add(index as u32 * 7919));
+            voice.configure(&voice_config);
+            voices.push(voice);
         }
+        let mut engine = Self {
+            voices: voices.into_boxed_slice(), mod_matrix: ModMatrix::new(),
+            manager: VoiceManager::new(), sample_rate,
+            master_volume: db_to_gain(config.master), master_smooth: 1.0,
+            filter3: core::array::from_fn(|_| PresetFilter::new(sample_rate)),
+            effects: EffectsChain::new(sample_rate), global_env: Adsr::new(sample_rate),
+            global_lfo: Lfo::new(sample_rate), globals: GlobalSources::default(),
+            previous_global_mod: ModulationValues::default(), xy_smooth: [0.0; 2],
+            last_note: None, held_velocity: [0; 128], held_order: [0; 128], held_count: 0,
+            arpeggiator: Arpeggiator::new(), voice_unison: [(0.0, 0.0, 1.0); VOICES], config,
+        };
+        engine.apply_parameters();
+        engine
     }
 
-    /// Load a preset into the engine
-    ///
-    /// This will apply the preset's parameters to all new voices that are triggered.
-    /// Currently active voices will not be affected.
+    pub fn config(&self) -> &EngineConfig { &self.config }
+
+    /// Charge un patch complet hors callback : prépare et partage les tables dessinées.
+    /// Une matrice invalide est rejetée avant toute modification de l'état courant.
+    pub fn load_config(&mut self, config: EngineConfig) -> Result<(), InvalidModulationId> {
+        let mut matrix = ModMatrix::new();
+        matrix.configure(&config.mod_matrix)?;
+        let tables = Rc::new(DrawTableBank::new(&[config.osc1, config.osc2, config.osc3]));
+        self.all_sound_off();
+        self.config = config;
+        self.mod_matrix = matrix;
+        for voice in &mut self.voices { voice.set_draw_tables(Rc::clone(&tables)); }
+        self.global_lfo.set_draw_tables(tables);
+        self.apply_parameters();
+        Ok(())
+    }
+
     #[cfg(feature = "std")]
-    pub fn load_preset(&mut self, preset: &OdinPreset) {
-        let config = PresetConfig::from_preset(preset);
-        self.master_volume = config.master_volume;
-        self.preset_config = Some(config);
+    pub fn load_preset(&mut self, preset: &crate::preset::OdinPreset) -> Result<(), InvalidModulationId> {
+        self.load_config(EngineConfig::from_preset(preset))
     }
 
-    /// Load a preset configuration directly
-    ///
-    /// Useful for allocation-free updates from real-time threads
-    #[cfg(feature = "std")]
-    pub fn load_config(&mut self, config: PresetConfig) {
-        self.master_volume = config.master_volume;
-        self.preset_config = Some(config);
+    /// Mise à jour d'un paramètre audio sur les voix actives et futures, sans allocation.
+    /// Ne recharge ni les dessins ni la matrice, ne réinitialise aucune enveloppe.
+    pub fn set_parameter(&mut self, id: ParameterId, value: f32) -> Result<(), ParameterError> {
+        id.set(&mut self.config, value)?;
+        self.apply_parameters();
+        Ok(())
     }
 
-    /// Apply preset configuration to a specific voice
-    #[cfg(feature = "std")]
-    fn apply_preset_to_voice(&mut self, voice_idx: usize) {
-        if let Some(ref config) = self.preset_config {
-            let voice = &mut self.voices[voice_idx];
-            let note = voice.note;
+    /// Mise à jour groupée : validation avant mutation, puis un seul recalcul DSP.
+    pub fn set_parameters(&mut self, values: &[(ParameterId, f32)]) -> Result<(), ParameterError> {
+        if values.iter().any(|(_, value)| !value.is_finite()) {
+            return Err(ParameterError::NonFinite);
+        }
+        for &(id, value) in values { id.set(&mut self.config, value)?; }
+        self.apply_parameters();
+        Ok(())
+    }
 
-            // Apply oscillator pitch offsets and volumes
-            for (i, osc) in voice.oscillators.iter_mut().enumerate() {
-                let pitch_offset = (config.osc_octaves[i] * 12 + config.osc_semitones[i]) as f32;
-                let freq = crate::dsp::midi_to_freq(note)
-                    * libm::powf(2.0, pitch_offset / 12.0);
-                osc.set_frequency(freq);
-            }
+    pub fn parameter(&self, id: ParameterId) -> f32 { id.get(&self.config) }
 
-            // Store volumes for processing
-            voice.osc_volumes = config.osc_volumes;
+    fn apply_parameters(&mut self) {
+        let config = self.config.voice();
+        for (index, voice) in self.voices.iter_mut().enumerate() {
+            voice.configure(&config);
+            voice.set_tempo(self.config.bpm);
+            let (pan, detune, gain) = self.voice_unison[index];
+            voice.set_unison(pan * self.config.unison_width, detune * self.config.unison_detune, gain);
+            voice.set_unison_position(pan);
+        }
+        for filter in &mut self.filter3 { filter.configure(&self.config.filter3); }
+        self.global_env.configure(&self.config.env4);
+        self.global_lfo.configure(&self.config.lfo4);
+        self.global_lfo.set_tempo(self.config.bpm);
+        self.effects.configure(&self.config.delay, &self.config.phaser, &self.config.flanger,
+            &self.config.chorus, &self.config.reverb, self.config.fx_positions);
+        self.effects.set_bpm(self.config.bpm);
+        self.master_volume = db_to_gain(self.config.master);
+    }
 
-            // Apply filter settings
-            voice.filter_base_cutoff = config.filter_frequency;
-            voice.filter1.set_cutoff(config.filter_frequency);
-            voice.filter1.set_resonance(config.filter_resonance);
-            voice.filter_env_amount = config.filter_env_amount;
-
-            // Apply envelopes
-            voice.amp_env.set_attack(config.amp_attack);
-            voice.amp_env.set_decay(config.amp_decay);
-            voice.amp_env.set_sustain(config.amp_sustain);
-            voice.amp_env.set_release(config.amp_release);
-
-            voice.filter_env.set_attack(config.filter_attack);
-            voice.filter_env.set_decay(config.filter_decay);
-            voice.filter_env.set_sustain(config.filter_sustain);
-            voice.filter_env.set_release(config.filter_release);
+    /// Tempo hôte en BPM; préserve la phase des LFO et les queues d'effets.
+    pub fn set_tempo(&mut self, bpm: f32) {
+        if bpm.is_finite() && bpm > 0.0 {
+            self.config.bpm = bpm;
+            self.apply_parameters();
         }
     }
 
-    /// Find a free voice or steal one
-    fn allocate_voice(&mut self) -> usize {
-        // First, try to find an inactive voice
-        for (i, voice) in self.voices.iter().enumerate() {
-            if !voice.active {
-                return i;
-            }
-        }
-
-        // All voices active, need to steal
-        match self.allocation {
-            VoiceAllocation::RoundRobin => {
-                let voice = self.next_voice;
-                self.next_voice = (self.next_voice + 1) % VOICES;
-                voice
-            }
-            VoiceAllocation::StealOldest => {
-                // For now, just use round-robin
-                let voice = self.next_voice;
-                self.next_voice = (self.next_voice + 1) % VOICES;
-                voice
-            }
-            VoiceAllocation::StealQuietest => {
-                // Find voice with lowest amplitude envelope value
-                let mut quietest = 0;
-                let mut min_amp = f32::MAX;
-                for (i, voice) in self.voices.iter().enumerate() {
-                    let amp = voice.velocity; // Simplified - should use envelope value
-                    if amp < min_amp {
-                        min_amp = amp;
-                        quietest = i;
-                    }
-                }
-                quietest
-            }
+    pub fn channel_pressure(&mut self, value: u8) { self.globals.channel_pressure = value.min(127) as f32 / 127.0; }
+    pub fn poly_aftertouch(&mut self, note: u8, value: u8) {
+        for voice in &mut self.voices {
+            if voice.active && voice.note == note { voice.set_aftertouch(value.min(127) as f32 / 127.0); }
         }
     }
+
+    pub fn set_modulation_row(&mut self, index: usize, row: crate::preset::ModMatrixRow) -> Result<(), InvalidModulationId> {
+        // Validation transactionnelle : une erreur ne remplace pas la matrice active.
+        let mut rows = self.config.mod_matrix;
+        if let Some(target) = rows.get_mut(index) { *target = row; }
+        else {
+            return Err(InvalidModulationId {
+                row: index, field: crate::mod_matrix::ModulationField::RowIndex, id: index as i32,
+            });
+        }
+        let mut matrix = ModMatrix::new();
+        matrix.configure(&rows)?;
+        self.mod_matrix = matrix;
+        self.config.mod_matrix = rows;
+        Ok(())
+    }
+
+    fn held_on(&mut self, note: u8, velocity: u8) {
+        self.held_off(note);
+        self.held_order[self.held_count] = note;
+        self.held_count += 1;
+        self.held_velocity[note as usize] = velocity;
+    }
+    fn held_off(&mut self, note: u8) -> bool {
+        let newest = self.held_count > 0 && self.held_order[self.held_count - 1] == note;
+        if let Some(index) = self.held_order[..self.held_count].iter().position(|&n| n == note) {
+            self.held_order.copy_within(index + 1..self.held_count, index);
+            self.held_count -= 1;
+        }
+        self.held_velocity[note as usize] = 0;
+        newest
+    }
+
+    fn start_note(&mut self, note: u8, velocity: u8, arp: [f32; 2], remember: bool) {
+        if remember { self.held_on(note, velocity); }
+        if self.config.play_mode == PlayMode::Mono { self.global_env.trigger(); }
+        else { self.global_env.trigger_legato(); }
+        self.global_lfo.retrigger();
+        self.effects.note_on();
+        let count = unison_count(self.config.unison_voices);
+        let active = core::array::from_fn(|i| self.voices[i].active);
+        let releasing = core::array::from_fn(|i| self.voices[i].is_releasing());
+        let indices = self.manager.allocate(note, count, self.config.play_mode == PlayMode::Poly, &active, &releasing);
+        for (i, &index) in indices[..count].iter().enumerate() {
+            let (pan, detune, gain) = unison(count, i);
+            self.voice_unison[index] = (pan, detune, gain);
+            self.voices[index].set_arp_modulation(arp);
+            self.voices[index].start(note, velocity, self.last_note,
+                pan * self.config.unison_width, detune * self.config.unison_detune,
+                gain, self.config.play_mode == PlayMode::Legato);
+            self.voices[index].set_unison_position(pan);
+        }
+        self.last_note = Some(note);
+        for filter in &mut self.filter3 { filter.set_midi_unshifted(note, velocity); }
+    }
+
+    fn stop_note(&mut self, note: u8, remember: bool) {
+        let newest = remember && self.held_off(note);
+        if self.config.play_mode != PlayMode::Poly && newest && self.held_count > 0 {
+            let previous = self.held_order[self.held_count - 1];
+            self.start_note(previous, self.held_velocity[previous as usize], [0.0; 2], false);
+        }
+        for (index, voice) in self.voices.iter_mut().enumerate() {
+            if voice.active && voice.note == note {
+                if self.manager.sustain { self.manager.defer(index, note); }
+                else { voice.note_off(); }
+            }
+        }
+        if !self.voices.iter().any(|voice| voice.active && !voice.is_releasing()) { self.global_env.release(); }
+    }
+
+    pub fn all_notes_off(&mut self) {
+        for voice in &mut self.voices { voice.note_off(); }
+        self.manager.deferred.fill(false);
+        self.held_count = 0;
+        self.held_velocity.fill(0);
+        self.arpeggiator.reset();
+        self.global_env.release();
+    }
+
+    pub fn all_sound_off(&mut self) {
+        for voice in &mut self.voices { voice.reset(); }
+        for filter in &mut self.filter3 { filter.reset(); }
+        self.effects.reset();
+        self.global_env.reset();
+        self.global_lfo.reset();
+        self.manager = VoiceManager::new();
+        self.held_count = 0;
+        self.held_velocity.fill(0);
+        self.arpeggiator.reset();
+        self.last_note = None;
+        self.previous_global_mod = ModulationValues::default();
+    }
+
+    pub fn active_voice_count(&self) -> usize { self.voices.iter().filter(|voice| voice.active).count() }
 }
 
 impl SynthEngine for OdinEngine {
     fn note_on(&mut self, note: u8, velocity: u8) {
-        // Don't trigger if velocity is 0 (some MIDI devices send note-on with vel 0 for note-off)
-        if velocity == 0 {
-            self.note_off(note);
-            return;
-        }
-
-        // Allocate a voice
-        let voice_idx = self.allocate_voice();
-
-        // Clear old mapping if this voice was playing another note
-        if let Some(old_note) = self.voices[voice_idx].active.then_some(self.voices[voice_idx].note) {
-            self.note_to_voice[old_note as usize] = None;
-        }
-
-        // Start the note
-        self.voices[voice_idx].note_on(note, velocity);
-
-        // Apply preset configuration if available
-        #[cfg(feature = "std")]
-        self.apply_preset_to_voice(voice_idx);
-
-        self.note_to_voice[note as usize] = Some(voice_idx);
+        if note >= 128 { return; }
+        if velocity == 0 { self.note_off(note); return; }
+        if self.config.arpeggiator.on { self.arpeggiator.note_on(note, velocity.min(127), &self.config.arpeggiator); }
+        else { self.start_note(note, velocity.min(127), [0.0; 2], true); }
     }
 
     fn note_off(&mut self, note: u8) {
-        if let Some(voice_idx) = self.note_to_voice[note as usize] {
-            self.voices[voice_idx].note_off();
-            self.note_to_voice[note as usize] = None;
-        }
+        if note >= 128 { return; }
+        if self.config.arpeggiator.on { self.arpeggiator.note_off(note, &self.config.arpeggiator); }
+        else { self.stop_note(note, true); }
     }
 
     fn control_change(&mut self, cc: u8, value: u8) {
+        let normalized = value.min(127) as f32 / 127.0;
         match cc {
-            1 => {
-                // Mod wheel - could route to mod matrix
-            }
-            7 => {
-                // Volume
-                self.master_volume = value as f32 / 127.0;
-            }
+            1 => self.config.modwheel = normalized,
+            2 => self.globals.breath = normalized,
+            7 => self.master_volume = normalized,
             64 => {
-                // Sustain pedal
-                // TODO: implement sustain
+                let sustain = value >= 64;
+                self.manager.sustain = sustain;
+                self.arpeggiator.set_sustain(sustain, &self.config.arpeggiator);
+                if !sustain {
+                    for (index, voice) in self.voices.iter_mut().enumerate() {
+                        if self.manager.deferred[index] { voice.note_off(); }
+                    }
+                    self.manager.deferred.fill(false);
+                    if !self.voices.iter().any(|voice| voice.active && !voice.is_releasing()) { self.global_env.release(); }
+                }
             }
+            67 => self.globals.soft_pedal = normalized,
+            120 => self.all_sound_off(),
+            123 => self.all_notes_off(),
             _ => {}
         }
     }
 
-    fn pitch_bend(&mut self, _value: i16) {
-        // TODO: implement pitch bend
-    }
+    fn pitch_bend(&mut self, value: i16) { self.config.pitchbend = value.clamp(-8192, 8191) as f32 / 8192.0; }
 
     fn process(&mut self, output: &mut [f32], channels: usize) {
-        // Clear output buffer
         output.fill(0.0);
-
-        let samples = output.len() / channels;
-
-        for sample_idx in 0..samples {
+        if channels == 0 { return; }
+        for frame in output.chunks_exact_mut(channels) {
+            if self.config.arpeggiator.on {
+                let ratio = crate::preset::sync_ratio(self.config.arpeggiator.sync_numerator,
+                    self.config.arpeggiator.sync_denominator);
+                let (on, off, count) = self.arpeggiator.tick(&self.config.arpeggiator, self.sample_rate,
+                    self.config.bpm, ratio, self.previous_global_mod.get(970), self.previous_global_mod.get(973));
+                if let Some(note) = on { self.start_note(note.note, note.velocity, note.modulation, false); }
+                for &note in &off[..count] { self.stop_note(note, false); }
+            }
+            self.master_smooth = 0.995 * self.master_smooth + 0.005 * self.master_volume;
+            self.globals.pitchwheel = 0.998 * self.globals.pitchwheel + 0.002 * self.config.pitchbend;
+            self.globals.modwheel = 0.998 * self.globals.modwheel + 0.002 * self.config.modwheel;
+            self.xy_smooth[0] = 0.998 * self.xy_smooth[0] + 0.002 * self.config.xy_x;
+            self.xy_smooth[1] = 0.998 * self.xy_smooth[1] + 0.002 * self.config.xy_y;
+            self.globals.x = (self.xy_smooth[0] + self.previous_global_mod.get(980)).clamp(0.0, 1.0);
+            self.globals.y = (self.xy_smooth[1] + self.previous_global_mod.get(982)).clamp(0.0, 1.0);
+            self.globals.sustain_pedal = if self.manager.sustain { 1.0 } else { 0.0 };
+            // Matrice entière avant toute avancée des sources DSP (un sample de retard upstream).
+            let previous = self.globals;
+            let newest = self.manager.history[0];
+            let sources: ModSources = *self.voices[newest].mod_sources();
+            let modulation = self.mod_matrix.apply_global(&sources, &previous);
+            let envelope = modulation.envelope(3);
+            self.global_env.set_modulation([envelope.attack, envelope.decay, envelope.sustain, envelope.release]);
+            self.globals.env = self.global_env.process();
+            self.global_lfo.set_modulation(modulation.lfo(3));
+            self.globals.lfo = self.global_lfo.process();
             let mut left = 0.0;
             let mut right = 0.0;
-
-            // Sum all voices
             for voice in &mut self.voices {
-                if voice.active {
-                    let (l, r) = voice.process();
-                    left += l;
-                    right += r;
-                }
+                voice.set_global_modulation(&modulation);
+                let (l, r) = voice.process_with_modulation(&self.mod_matrix, &previous);
+                left += l;
+                right += r;
             }
-
-            // Apply master volume
-            left *= self.master_volume;
-            right *= self.master_volume;
-
-            // Write to output buffer
-            let base_idx = sample_idx * channels;
-            if channels >= 1 {
-                output[base_idx] = left;
+            let filter_env = self.voices[newest].filter_env_value();
+            let filter_mod = modulation.filter(2).into();
+            for filter in &mut self.filter3 {
+                filter.set_env_value(filter_env);
+                filter.set_modulation(&filter_mod);
             }
-            if channels >= 2 {
-                output[base_idx + 1] = right;
-            }
+            left = self.filter3[0].process(left);
+            right = self.filter3[1].process(right);
+            self.effects.set_modulation(&modulation);
+            (left, right) = self.effects.process(left, right);
+            let gain = modulate_gain(self.master_smooth, modulation.get(1000));
+            frame[0] = left * gain;
+            if channels > 1 { frame[1] = right * gain; }
+            self.previous_global_mod = modulation;
         }
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate;
-        for voice in &mut self.voices {
-            voice.set_sample_rate(sample_rate);
-        }
+        for voice in &mut self.voices { voice.set_sample_rate(sample_rate); }
+        for filter in &mut self.filter3 { filter.set_sample_rate(sample_rate); }
+        self.global_env.set_sample_rate(sample_rate);
+        self.global_lfo.set_sample_rate(sample_rate);
+        self.effects.set_sample_rate(sample_rate);
     }
+}
+
+fn db_to_gain(db: f32) -> f32 {
+    if db <= -100.0 { 0.0 } else { libm::powf(10.0, db / 20.0) }
 }

@@ -12,5 +12,4 @@ repository = "https://github.com/bascanada/odin2-rs"
 
 [workspace.dependencies]
 libm = "0.2"
-wide = "0.7"
 hound = "3.5"
