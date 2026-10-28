@@ -1,15 +1,15 @@
-//! JUCE ValueTree Binary Parser for Odin 2 Presets
-//!
-//! This is a specialized parser for the Odin 2 .odin preset format.
+//! Décodage structurel du flux JUCE ValueTree (pas de recherche de marqueurs).
+//! Format: type UTF-8 terminé par zéro, compte compressé, propriétés var,
+//! compte compressé des enfants, puis enfants récursifs. Voir JUCE
+//! juce_ValueTree.cpp et juce_Variant.cpp, writeToStream/readFromStream.
 
 extern crate alloc;
-
 use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use std::io::{self, Read, Seek};
 
-/// Error type for ValueTree parsing
 #[derive(Debug)]
 pub enum ValueTreeError {
     Io(io::Error),
@@ -18,408 +18,251 @@ pub enum ValueTreeError {
     InvalidUtf8,
     UnsupportedType(u8),
 }
-
 impl From<io::Error> for ValueTreeError {
-    fn from(e: io::Error) -> Self {
-        ValueTreeError::Io(e)
-    }
+    fn from(value: io::Error) -> Self { Self::Io(value) }
 }
-
 impl std::fmt::Display for ValueTreeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ValueTreeError::Io(e) => write!(f, "IO error: {}", e),
-            ValueTreeError::InvalidFormat(s) => write!(f, "Invalid format: {}", s),
-            ValueTreeError::UnexpectedEof => write!(f, "Unexpected end of file"),
-            ValueTreeError::InvalidUtf8 => write!(f, "Invalid UTF-8 string"),
-            ValueTreeError::UnsupportedType(t) => write!(f, "Unsupported value type: {}", t),
+            Self::Io(e) => write!(f, "IO error: {e}"),
+            Self::InvalidFormat(e) => write!(f, "Invalid format: {e}"),
+            Self::UnexpectedEof => f.write_str("Unexpected end of file"),
+            Self::InvalidUtf8 => f.write_str("Invalid UTF-8 string"),
+            Self::UnsupportedType(t) => write!(f, "Unsupported value type: {t}"),
         }
     }
 }
-
 impl std::error::Error for ValueTreeError {}
 
-/// Variant value type
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum VariantValue {
+    Void,
+    Undefined,
     Int(i32),
     Int64(i64),
     Double(f64),
     String(String),
     Bool(bool),
+    Array(Vec<VariantValue>),
+    Binary(Vec<u8>),
 }
-
 impl VariantValue {
-    pub fn as_f32(&self) -> Option<f32> {
-        match self {
-            VariantValue::Double(d) => Some(*d as f32),
-            VariantValue::Int(i) => Some(*i as f32),
-            VariantValue::Int64(i) => Some(*i as f32),
-            _ => None,
-        }
-    }
-
     pub fn as_f64(&self) -> Option<f64> {
         match self {
-            VariantValue::Double(d) => Some(*d),
-            VariantValue::Int(i) => Some(*i as f64),
-            VariantValue::Int64(i) => Some(*i as f64),
+            Self::Int(v) => Some(*v as f64),
+            Self::Int64(v) => Some(*v as f64),
+            Self::Double(v) => Some(*v),
+            Self::Bool(v) => Some(if *v { 1.0 } else { 0.0 }),
+            Self::String(v) => v.trim().parse().ok(),
             _ => None,
         }
     }
-
-    pub fn as_i32(&self) -> Option<i32> {
-        match self {
-            VariantValue::Int(i) => Some(*i),
-            VariantValue::Int64(i) => Some(*i as i32),
-            VariantValue::Double(d) => Some(*d as i32),
-            _ => None,
-        }
-    }
-
+    pub fn as_f32(&self) -> Option<f32> { self.as_f64().map(|v| v as f32) }
+    pub fn as_i32(&self) -> Option<i32> { self.as_f64().map(|v| v as i32) }
     pub fn as_string(&self) -> Option<&str> {
-        match self {
-            VariantValue::String(s) => Some(s.as_str()),
-            _ => None,
-        }
+        if let Self::String(v) = self { Some(v) } else { None }
     }
-
     pub fn as_bool(&self) -> Option<bool> {
-        match self {
-            VariantValue::Bool(b) => Some(*b),
-            VariantValue::Int(i) => Some(*i != 0),
-            VariantValue::Double(d) => Some(*d != 0.0),
-            _ => None,
+        if let Self::String(v) = self {
+            return Some(v.trim().eq_ignore_ascii_case("true") || v.trim().eq_ignore_ascii_case("yes") || v.trim().parse::<i64>().unwrap_or(0) != 0);
         }
+        self.as_f64().map(|v| v != 0.0)
     }
 }
 
-/// Parsed Odin preset data
+/// Arbre complet: les nœuds inconnus ne sont pas perdus et restent auditables.
+#[derive(Debug, Clone, Default)]
+pub struct ValueTreeNode {
+    pub node_type: String,
+    pub properties: BTreeMap<String, VariantValue>,
+    pub children: Vec<ValueTreeNode>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ValueTree {
-    /// Audio parameters (PARAM entries)
+    pub root: ValueTreeNode,
     pub params: BTreeMap<String, f64>,
-    /// FX section properties
     pub fx: BTreeMap<String, VariantValue>,
-    /// LFO section properties
     pub lfo: BTreeMap<String, VariantValue>,
-    /// Misc section properties
     pub misc: BTreeMap<String, VariantValue>,
-    /// Mod matrix section properties
     pub mod_matrix: BTreeMap<String, VariantValue>,
-    /// Oscillator section properties
     pub osc: BTreeMap<String, VariantValue>,
+    pub draw: BTreeMap<String, VariantValue>,
+    /// Propriétés/nœuds hors schéma, avec leur chemin réel dans l'arbre.
+    pub unmapped: Vec<String>,
 }
-
 impl ValueTree {
-    /// Parse an Odin preset from binary data
     pub fn from_bytes(data: &[u8]) -> Result<Self, ValueTreeError> {
-        let mut cursor = io::Cursor::new(data);
-        Self::read_from(&mut cursor)
-    }
-
-    /// Read an Odin preset from a reader
-    pub fn read_from<R: Read + Seek>(reader: &mut R) -> Result<Self, ValueTreeError> {
-        let mut tree = ValueTree::default();
-
-        // Read the entire file into memory for easier parsing
-        let mut data = Vec::new();
-        reader.read_to_end(&mut data)?;
-
-        // Verify header
-        if data.len() < 5 || &data[0..4] != b"Odin" {
-            return Err(ValueTreeError::InvalidFormat(
-                "Not an Odin preset file".to_string(),
-            ));
+        let mut decoder = Decoder { data, pos: 0 };
+        let root = decoder.node(0)?;
+        if decoder.pos != data.len() {
+            return Err(ValueTreeError::InvalidFormat(format!("{} trailing bytes", data.len() - decoder.pos)));
         }
-
-        // Parse PARAM entries
-        tree.parse_params(&data)?;
-
-        // Parse section properties
-        tree.parse_section(&data, b"fx\x00", &mut tree.fx.clone())?;
-        tree.parse_section(&data, b"lfo\x00", &mut tree.lfo.clone())?;
-        tree.parse_section(&data, b"misc\x00", &mut tree.misc.clone())?;
-        tree.parse_section(&data, b"osc\x00", &mut tree.osc.clone())?;
-
-        // Re-parse to actually store values (avoiding borrow issues)
-        let mut fx = BTreeMap::new();
-        let mut lfo = BTreeMap::new();
-        let mut misc = BTreeMap::new();
-        let mut osc = BTreeMap::new();
-        let mut mod_matrix = BTreeMap::new();
-
-        Self::parse_section_into(&data, b"fx\x00", &mut fx);
-        Self::parse_section_into(&data, b"lfo\x00", &mut lfo);
-        Self::parse_section_into(&data, b"misc\x00", &mut misc);
-        Self::parse_section_into(&data, b"osc\x00", &mut osc);
-        Self::parse_section_into(&data, b"mod\x00", &mut mod_matrix);
-
-        tree.fx = fx;
-        tree.lfo = lfo;
-        tree.misc = misc;
-        tree.osc = osc;
-        tree.mod_matrix = mod_matrix;
-
+        if root.node_type != "Odin" {
+            return Err(ValueTreeError::InvalidFormat("root is not Odin".to_string()));
+        }
+        let mut tree = Self { root, ..Self::default() };
+        for name in tree.root.properties.keys() { tree.unmapped.push(format!("Odin/{name}")); }
+        for (index, child) in tree.root.children.iter().enumerate() {
+            let path = format!("Odin/{index}:{}", child.node_type);
+            if child.node_type == "PARAM" {
+                let id = child.properties.get("id").and_then(VariantValue::as_string);
+                let value = child.properties.get("value").and_then(VariantValue::as_f64);
+                if let (Some(id), Some(value)) = (id, value) {
+                    if tree.params.insert(id.to_string(), value).is_some() {
+                        return Err(ValueTreeError::InvalidFormat(format!("duplicate parameter {id}")));
+                    }
+                    for key in child.properties.keys().filter(|k| k.as_str() != "id" && k.as_str() != "value") {
+                        tree.unmapped.push(format!("{path}/{key}"));
+                    }
+                } else { collect_paths(child, &path, &mut tree.unmapped); }
+            } else {
+                let target = match child.node_type.as_str() {
+                    "fx" => Some(&mut tree.fx), "lfo" => Some(&mut tree.lfo),
+                    "misc" => Some(&mut tree.misc), "mod" => Some(&mut tree.mod_matrix),
+                    "osc" => Some(&mut tree.osc), "draw" => Some(&mut tree.draw),
+                    _ => None,
+                };
+                if let Some(target) = target {
+                    for (key, value) in &child.properties {
+                        if target.insert(key.clone(), value.clone()).is_some() {
+                            return Err(ValueTreeError::InvalidFormat(format!("duplicate property {path}/{key}")));
+                        }
+                    }
+                } else { collect_paths(child, &path, &mut tree.unmapped); }
+            }
+            // No nested property is silently absorbed by a recognized parent.
+            for (n, nested) in child.children.iter().enumerate() {
+                collect_paths(nested, &format!("{path}/{n}:{}", nested.node_type), &mut tree.unmapped);
+            }
+        }
         Ok(tree)
     }
-
-    fn parse_params(&mut self, data: &[u8]) -> Result<(), ValueTreeError> {
-        let param_marker = b"PARAM\x00";
-        let mut pos = 0;
-
-        while let Some(idx) = find_bytes(&data[pos..], param_marker) {
-            let abs_idx = pos + idx;
-            pos = abs_idx + param_marker.len();
-
-            // Skip header bytes (01 02)
-            if pos + 2 > data.len() {
-                break;
-            }
-            pos += 2;
-
-            // Read "id" property name
-            let (id_name, new_pos) = read_string(data, pos)?;
-            pos = new_pos;
-
-            if id_name != "id" {
-                continue;
-            }
-
-            // Skip: 01 length
-            if pos + 2 > data.len() {
-                break;
-            }
-            pos += 2;
-
-            // Read type byte
-            let type_byte = data[pos];
-            pos += 1;
-
-            // Read parameter ID (string)
-            if type_byte != 5 {
-                continue;
-            }
-            let (param_id, new_pos) = read_string(data, pos)?;
-            pos = new_pos;
-
-            // Read "value" property name
-            let (value_name, new_pos) = read_string(data, pos)?;
-            pos = new_pos;
-
-            if value_name != "value" {
-                continue;
-            }
-
-            // Skip: 01 length
-            if pos + 2 > data.len() {
-                break;
-            }
-            pos += 2;
-
-            // Read type byte
-            let type_byte = data[pos];
-            pos += 1;
-
-            // Read value (should be double)
-            if (type_byte == 4 || type_byte == 9) && pos + 8 <= data.len() {
-                let value = f64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-                self.params.insert(param_id, value);
-                pos += 8;
-            }
-        }
-
-        Ok(())
+    pub fn read_from<R: Read + Seek>(reader: &mut R) -> Result<Self, ValueTreeError> {
+        let mut bytes = Vec::new(); reader.read_to_end(&mut bytes)?; Self::from_bytes(&bytes)
     }
-
-    fn parse_section(
-        &self,
-        data: &[u8],
-        marker: &[u8],
-        _props: &mut BTreeMap<String, VariantValue>,
-    ) -> Result<(), ValueTreeError> {
-        // Find section marker
-        if find_bytes(data, marker).is_none() {
-            return Ok(());
-        }
-        Ok(())
-    }
-
-    fn parse_section_into(
-        data: &[u8],
-        marker: &[u8],
-        props: &mut BTreeMap<String, VariantValue>,
-    ) {
-        if let Some(idx) = find_bytes(data, marker) {
-            let mut pos = idx + marker.len();
-
-            // Read number of properties (01 + count as single byte after that)
-            if pos >= data.len() {
-                return;
-            }
-
-            // Skip the 01 byte if present
-            if data[pos] == 0x01 {
-                pos += 1;
-            }
-
-            // Read property count (next byte)
-            if pos >= data.len() {
-                return;
-            }
-            let num_props = data[pos] as usize;
-            pos += 1;
-
-            // Read properties
-            for _ in 0..num_props {
-                if pos >= data.len() {
-                    break;
-                }
-
-                // Read property name
-                let (prop_name, new_pos) = match read_string(data, pos) {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-                pos = new_pos;
-
-                // Skip 01 length bytes
-                if pos + 2 > data.len() {
-                    break;
-                }
-                pos += 2;
-
-                // Read type byte
-                if pos >= data.len() {
-                    break;
-                }
-                let type_byte = data[pos];
-                pos += 1;
-
-                // Read value based on type
-                let value = match type_byte {
-                    1 => {
-                        // Int32
-                        if pos + 4 > data.len() {
-                            break;
-                        }
-                        let v = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-                        pos += 4;
-                        VariantValue::Int(v)
-                    }
-                    2 => VariantValue::Bool(false),
-                    3 => VariantValue::Bool(true),
-                    4 | 9 => {
-                        // Double
-                        if pos + 8 > data.len() {
-                            break;
-                        }
-                        let v = f64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-                        pos += 8;
-                        VariantValue::Double(v)
-                    }
-                    5 => {
-                        // String
-                        let (s, new_pos) = match read_string(data, pos) {
-                            Ok(r) => r,
-                            Err(_) => break,
-                        };
-                        pos = new_pos;
-                        VariantValue::String(s)
-                    }
-                    _ => {
-                        // Unknown type, try to skip
-                        continue;
-                    }
-                };
-
-                props.insert(prop_name, value);
-            }
-        }
-    }
-
-    /// Get a parameter value
-    pub fn get_param(&self, name: &str) -> Option<f64> {
-        self.params.get(name).copied()
-    }
-
-    /// Get an FX property
-    pub fn get_fx(&self, name: &str) -> Option<&VariantValue> {
-        self.fx.get(name)
-    }
-
-    /// Get an LFO property
-    pub fn get_lfo(&self, name: &str) -> Option<&VariantValue> {
-        self.lfo.get(name)
-    }
-
-    /// Get a misc property
-    pub fn get_misc(&self, name: &str) -> Option<&VariantValue> {
-        self.misc.get(name)
-    }
-
-    /// Get an osc property
-    pub fn get_osc(&self, name: &str) -> Option<&VariantValue> {
-        self.osc.get(name)
-    }
-
-    /// Get a mod matrix property
-    pub fn get_mod(&self, name: &str) -> Option<&VariantValue> {
-        self.mod_matrix.get(name)
+    pub fn get_param(&self, name: &str) -> Option<f64> { self.params.get(name).copied() }
+    pub fn get_misc(&self, name: &str) -> Option<&VariantValue> { self.misc.get(name) }
+    pub fn get_fx(&self, name: &str) -> Option<&VariantValue> { self.fx.get(name) }
+    pub fn get_lfo(&self, name: &str) -> Option<&VariantValue> { self.lfo.get(name) }
+    pub fn get_osc(&self, name: &str) -> Option<&VariantValue> { self.osc.get(name) }
+    pub fn get_mod(&self, name: &str) -> Option<&VariantValue> { self.mod_matrix.get(name) }
+}
+fn collect_paths(node: &ValueTreeNode, path: &str, out: &mut Vec<String>) {
+    if node.properties.is_empty() && node.children.is_empty() { out.push(path.to_string()); }
+    for name in node.properties.keys() { out.push(format!("{path}/{name}")); }
+    for (i, child) in node.children.iter().enumerate() {
+        collect_paths(child, &format!("{path}/{i}:{}", child.node_type), out);
     }
 }
-
-/// Find a byte pattern in data
-fn find_bytes(data: &[u8], pattern: &[u8]) -> Option<usize> {
-    data.windows(pattern.len())
-        .position(|window| window == pattern)
-}
-
-/// Read a null-terminated string
-fn read_string(data: &[u8], offset: usize) -> Result<(String, usize), ValueTreeError> {
-    if offset >= data.len() {
-        return Err(ValueTreeError::UnexpectedEof);
+struct Decoder<'a> { data: &'a [u8], pos: usize }
+impl<'a> Decoder<'a> {
+    fn bytes(&mut self, count: usize) -> Result<&'a [u8], ValueTreeError> {
+        let end = self.pos.checked_add(count).ok_or(ValueTreeError::UnexpectedEof)?;
+        let bytes = self.data.get(self.pos..end).ok_or(ValueTreeError::UnexpectedEof)?;
+        self.pos = end; Ok(bytes)
     }
-
-    let end = data[offset..]
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or(ValueTreeError::UnexpectedEof)?;
-
-    let s = String::from_utf8(data[offset..offset + end].to_vec())
-        .map_err(|_| ValueTreeError::InvalidUtf8)?;
-
-    Ok((s, offset + end + 1))
+    fn byte(&mut self) -> Result<u8, ValueTreeError> { Ok(self.bytes(1)?[0]) }
+    fn compressed(&mut self) -> Result<i32, ValueTreeError> {
+        let header = self.byte()?;
+        let count = (header & 0x7f) as usize;
+        if count > 4 { return Err(ValueTreeError::InvalidFormat("invalid compressed integer".to_string())); }
+        let mut value = 0u32;
+        for i in 0..count { value |= (self.byte()? as u32) << (i * 8); }
+        if value > i32::MAX as u32 { return Err(ValueTreeError::InvalidFormat("compressed integer overflow".to_string())); }
+        Ok(if header & 0x80 != 0 { -(value as i32) } else { value as i32 })
+    }
+    fn count(&mut self) -> Result<usize, ValueTreeError> {
+        let count = self.compressed()?;
+        if count < 0 || count as usize > self.data.len().saturating_sub(self.pos) {
+            return Err(ValueTreeError::InvalidFormat("invalid count".to_string()));
+        }
+        Ok(count as usize)
+    }
+    fn string(&mut self) -> Result<String, ValueTreeError> {
+        let count = self.data[self.pos..].iter().position(|b| *b == 0).ok_or(ValueTreeError::UnexpectedEof)?;
+        let bytes = self.bytes(count + 1)?;
+        String::from_utf8(bytes[..count].to_vec()).map_err(|_| ValueTreeError::InvalidUtf8)
+    }
+    fn variant(&mut self, depth: usize) -> Result<VariantValue, ValueTreeError> {
+        if depth > 128 { return Err(ValueTreeError::InvalidFormat("variant nesting limit".to_string())); }
+        let count = self.count()?;
+        if count == 0 { return Ok(VariantValue::Void); }
+        let payload = self.bytes(count)?;
+        let mut value = Decoder { data: payload, pos: 0 };
+        let marker = value.byte()?;
+        let result = match marker {
+            1 => VariantValue::Int(i32::from_le_bytes(value.bytes(4)?.try_into().unwrap())),
+            2 => VariantValue::Bool(true),
+            3 => VariantValue::Bool(false),
+            4 => VariantValue::Double(f64::from_le_bytes(value.bytes(8)?.try_into().unwrap())),
+            5 => VariantValue::String(value.string()?),
+            6 => VariantValue::Int64(i64::from_le_bytes(value.bytes(8)?.try_into().unwrap())),
+            7 => {
+                let count = value.count()?;
+                let mut array = Vec::with_capacity(count);
+                for _ in 0..count { array.push(value.variant(depth + 1)?); }
+                VariantValue::Array(array)
+            }
+            8 => VariantValue::Binary(value.bytes(payload.len() - 1)?.to_vec()),
+            9 => VariantValue::Undefined,
+            _ => return Err(ValueTreeError::UnsupportedType(marker)),
+        };
+        if value.pos != payload.len() { return Err(ValueTreeError::InvalidFormat("variant length mismatch".to_string())); }
+        Ok(result)
+    }
+    fn node(&mut self, depth: usize) -> Result<ValueTreeNode, ValueTreeError> {
+        if depth > 128 { return Err(ValueTreeError::InvalidFormat("tree nesting limit".to_string())); }
+        let node_type = self.string()?;
+        if node_type.is_empty() { return Err(ValueTreeError::InvalidFormat("empty node type".to_string())); }
+        let mut node = ValueTreeNode { node_type, ..ValueTreeNode::default() };
+        let properties = self.count()?;
+        for _ in 0..properties {
+            let name = self.string()?;
+            let value = self.variant(0)?;
+            if node.properties.insert(name, value).is_some() { return Err(ValueTreeError::InvalidFormat("duplicate property".to_string())); }
+        }
+        let children = self.count()?;
+        for _ in 0..children { node.children.push(self.node(depth + 1)?); }
+        Ok(node)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::println;
+    #[test]
+    fn juce_true_false_and_int64_markers() {
+        let bytes = b"Odin\0\x01\x03yes\0\x01\x01\x02no\0\x01\x01\x03wide\0\x01\x09\x06\x01\0\0\0\0\0\0\0\0";
+        let tree = ValueTree::from_bytes(bytes).unwrap();
+        assert_eq!(tree.root.properties["yes"], VariantValue::Bool(true));
+        assert_eq!(tree.root.properties["no"], VariantValue::Bool(false));
+        assert_eq!(tree.root.properties["wide"], VariantValue::Int64(1));
+    }
+    #[test]
+    fn truncation_is_not_a_partial_success() {
+        assert!(ValueTree::from_bytes(b"Odin\0\x01\x01x\0\x01\x09\x04").is_err());
+    }
 
     #[test]
-    fn test_parse_preset() {
-        let path = "/Users/william.quintal/Project/bascanada/odin2-rs/odin2/assets/Soundbanks/Factory Presets/Bass/Analog Bass [tx].odin";
-        if std::path::Path::new(path).exists() {
-            let data = std::fs::read(path).unwrap();
-            let result = ValueTree::from_bytes(&data);
-            match result {
-                Ok(tree) => {
-                    println!("Parsed {} parameters", tree.params.len());
-                    println!("Parsed {} osc properties", tree.osc.len());
-                    println!("Parsed {} misc properties", tree.misc.len());
-
-                    if let Some(v) = tree.get_param("osc1_vol") {
-                        println!("osc1_vol = {}", v);
-                    }
-                    if let Some(v) = tree.get_param("fil1_freq") {
-                        println!("fil1_freq = {}", v);
-                    }
-                }
-                Err(e) => {
-                    println!("Error: {}", e);
-                }
-            }
+    fn compressed_property_count_larger_than_one_byte() {
+        let mut bytes = b"Odin\0\0\x01\x01draw\0\x02\x2c\x01".to_vec();
+        for i in 0..300i32 {
+            bytes.extend_from_slice(format!("sample{i}\0").as_bytes());
+            bytes.extend_from_slice(&[1, 5, 1]);
+            bytes.extend_from_slice(&i.to_le_bytes());
         }
+        bytes.push(0);
+        let tree = ValueTree::from_bytes(&bytes).unwrap();
+        assert_eq!(tree.draw.len(), 300);
+        assert_eq!(tree.draw["sample299"], VariantValue::Int(299));
+    }
+
+    #[test]
+    fn unknown_descendant_is_reported_even_below_known_section() {
+        let bytes = b"Odin\0\0\x01\x01fx\0\0\x01\x01future\0\x01\x01x\0\x01\x05\x01\x2a\0\0\0\0";
+        let tree = ValueTree::from_bytes(bytes).unwrap();
+        let (_, audit) = crate::preset::OdinPreset::from_value_tree_audited(&tree).unwrap();
+        assert_eq!(audit.unread, ["Odin/0:fx/0:future/x"]);
     }
 }
