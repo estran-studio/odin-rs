@@ -2,7 +2,7 @@
 //! Traduction de Source/audio/Oscillators/{Oscillator,WavetableOsc1D,
 //! WavetableOsc2D,AnalogOscillator,MultiOscillator,VectorOscillator,
 //! ChiptuneOscillator,FMOscillator,PMOscillator,NoiseOscillator}.cpp.
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 use crate::constants::{SUBTABLES_PER_WAVETABLE, WAVETABLE_LENGTH};
 use crate::preset::{AnalogWaveform, OscillatorParams, OscillatorType};
 use super::draw::DrawTableBank;
@@ -37,7 +37,7 @@ pub struct PresetOscillator {
     tables: [usize; 4],
     modulator_table: usize,
     modulation: OscillatorModulation,
-    draws: Option<Rc<DrawTableBank>>,
+    draws: Option<Arc<DrawTableBank>>,
     oscillator_index: usize,
     sample_rate: f32,
     inverse_rate: f64,
@@ -112,7 +112,7 @@ impl PresetOscillator {
         };
         self.modulator_table = map_vector(params.modulator_wave);
     }
-    pub fn set_draw_tables(&mut self, tables: Rc<DrawTableBank>) { self.draws = Some(tables); }
+    pub fn set_draw_tables(&mut self, tables: Arc<DrawTableBank>) { self.draws = Some(tables); }
     /// Indice 0..2 pour sélectionner le dessin propre de cet oscillateur.
     pub fn set_oscillator_index(&mut self, index: usize) { self.oscillator_index = index.min(2); }
     pub(crate) fn set_raw_tables(&mut self, tables: [usize; 4]) { self.tables = tables; }

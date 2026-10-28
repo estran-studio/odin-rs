@@ -10,6 +10,12 @@ Sans `std`, construire un `EngineConfig` directement, puis appeler `load_config`
 
 `new`, `load_config`, `load_preset` et `set_sample_rate` sont **hors callback audio**. Le chargement prépare les tables dessinées partagées et arrête les voix/queues du patch précédent. Les sources C++ externes et le système de fichiers ne sont pas utilisés par le rendu Rust.
 
+`OdinEngine` est `Send` : une instance préparée peut être transférée au thread audio en Rust sûr.
+Les tables dessinées immuables utilisent `Arc`, cloné seulement au chargement, jamais par
+échantillon. Le test `prepared_engine_moves_to_audio_thread_without_changing_render` compare
+le rendu transféré au rendu local et vérifie zéro allocation dans le rendu du thread destinataire.
+Le remplacement et la destruction d'une instance restent hors callback.
+
 ## Pilotage générique en temps réel
 
 Le catalogue est partagé avec le parseur, et non reconstruit dans une seconde liste propre à l'hôte. Il inclut oscillateurs, filtres/drive, enveloppes, LFO, gains, pad XY, effets et paramètres audio de l'arpégiateur.

@@ -1,6 +1,6 @@
 //! Moteur polyphonique : ordre de traitement de PluginProcessorProcess.cpp.
 
-use alloc::{boxed::Box, rc::Rc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use crate::arpeggiator::Arpeggiator;
 use crate::config::EngineConfig;
 use crate::constants::VOICES;
@@ -85,11 +85,11 @@ impl OdinEngine {
     pub fn load_config(&mut self, config: EngineConfig) -> Result<(), InvalidModulationId> {
         let mut matrix = ModMatrix::new();
         matrix.configure(&config.mod_matrix)?;
-        let tables = Rc::new(DrawTableBank::new(&[config.osc1, config.osc2, config.osc3]));
+        let tables = Arc::new(DrawTableBank::new(&[config.osc1, config.osc2, config.osc3]));
         self.all_sound_off();
         self.config = config;
         self.mod_matrix = matrix;
-        for voice in &mut self.voices { voice.set_draw_tables(Rc::clone(&tables)); }
+        for voice in &mut self.voices { voice.set_draw_tables(Arc::clone(&tables)); }
         self.global_lfo.set_draw_tables(tables);
         self.apply_parameters();
         Ok(())

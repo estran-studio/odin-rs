@@ -1,6 +1,6 @@
 //! LFO Odin 2: tables originales et modulation exponentielle de 48 demi-tons.
 //! Sources: LFO.cpp:18–73, LFO.h:38–76, LFOTableData.cpp.
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 use super::{DrawTableBank, Oscillator};
 use super::preset_oscillator::{pitch, read_table, wrap};
 pub use crate::preset::LfoWaveform;
@@ -19,7 +19,7 @@ pub struct Lfo {
     reset_active: bool,
     sh_value: f32,
     random: u32,
-    draws: Option<Rc<DrawTableBank>>,
+    draws: Option<Arc<DrawTableBank>>,
 }
 impl Lfo {
     pub fn new(sample_rate: f32) -> Self {
@@ -35,7 +35,7 @@ impl Lfo {
         self.sync_ratio = sync_ratio(params.sync_numerator, params.sync_denominator);
         self.reset_active = params.reset;
     }
-    pub fn set_draw_tables(&mut self, tables: Rc<DrawTableBank>) { self.draws = Some(tables); }
+    pub fn set_draw_tables(&mut self, tables: Arc<DrawTableBank>) { self.draws = Some(tables); }
     pub fn set_modulation(&mut self, modulation: f32) { self.modulation = modulation; }
     pub fn set_tempo(&mut self, bpm: f32) { self.tempo = bpm; }
     pub fn retrigger(&mut self) { if self.reset_active { self.reset(); } }

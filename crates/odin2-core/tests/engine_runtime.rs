@@ -87,6 +87,33 @@ fn render_is_deterministic_and_independent_of_block_size() {
 }
 
 #[test]
+fn prepared_engine_moves_to_audio_thread_without_changing_render() {
+    let mut reference = OdinEngine::new(48000.0);
+    let mut transferred = OdinEngine::new(48000.0);
+    reference.load_config(patch()).unwrap();
+    transferred.load_config(patch()).unwrap();
+    reference.note_on(48, 100);
+    let mut expected = [0.0; 4096];
+    reference.process(&mut expected, 2);
+
+    // Le chargement reste sur le fil principal ; seule l'instance prête traverse.
+    let actual = std::thread::spawn(move || {
+        let mut output = [0.0; 4096];
+        OPERATIONS.with(|count| count.set(0));
+        TRACK.with(|track| track.set(true));
+        transferred.note_on(48, 100);
+        transferred.process(&mut output, 2);
+        transferred.note_off(48);
+        TRACK.with(|track| track.set(false));
+        assert_eq!(OPERATIONS.with(Cell::get), 0);
+        output
+    }).join().unwrap();
+
+    assert_eq!(actual, expected);
+    assert!(actual.iter().map(|sample| sample * sample).sum::<f32>() > 0.01);
+}
+
+#[test]
 fn note_off_releases_every_repeated_note_and_unison_voice() {
     let mut config = patch();
     config.unison_voices = 4;

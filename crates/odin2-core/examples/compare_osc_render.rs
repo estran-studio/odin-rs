@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use odin2_core::mod_matrix::{GlobalSources, ModMatrix};
 use odin2_core::voice::{Voice, VoiceConfig};
@@ -193,7 +193,7 @@ fn build_modulation(spec: &Spec) -> OscillatorModulation {
     }
 }
 
-fn run(spec: &Spec, bank: &Rc<DrawTableBank>, rate: u32, stimuli: &Path, out: &Path) -> Result<(), Box<dyn Error>> {
+fn run(spec: &Spec, bank: &Arc<DrawTableBank>, rate: u32, stimuli: &Path, out: &Path) -> Result<(), Box<dyn Error>> {
     let mut writer = BufWriter::new(File::create(out.join(format!("{}.csv", spec.name)))?);
     writeln!(writer, "frame,input,output")?;
     let reader = BufReader::new(File::open(stimuli.join(&spec.stim))?);
@@ -222,7 +222,7 @@ fn run(spec: &Spec, bank: &Rc<DrawTableBank>, rate: u32, stimuli: &Path, out: &P
         Box::new(move |_| voice.process_with_modulation(&matrix, &globals).0)
     } else if spec.kind == "lfo" {
         let mut lfo = Lfo::new(rate as f32);
-        lfo.set_draw_tables(Rc::clone(bank));
+        lfo.set_draw_tables(Arc::clone(bank));
         lfo.configure(&LfoParams {
             waveform: LfoWaveform::from(spec.geti("wave", 0)),
             frequency: spec.getf("freq", 1.0),
@@ -239,7 +239,7 @@ fn run(spec: &Spec, bank: &Rc<DrawTableBank>, rate: u32, stimuli: &Path, out: &P
         let params = build_params(spec);
         let modulation = build_modulation(spec);
         let mut osc = PresetOscillator::new(rate as f32);
-        osc.set_draw_tables(Rc::clone(bank));
+        osc.set_draw_tables(Arc::clone(bank));
         osc.set_oscillator_index(spec.geti("idx", 0) as usize);
         osc.set_seed(spec.get("seed", 1.0) as u32 + 1);
         osc.configure(&params);
@@ -286,7 +286,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (specs, seed) = read_specs(Path::new(&args[1]))?;
     let (stimuli, out, rate) = (Path::new(&args[2]), Path::new(&args[3]), args[4].parse::<u32>()?);
     fs::create_dir_all(out)?;
-    let bank = Rc::new(DrawTableBank::new(&draw_params(seed)));
+    let bank = Arc::new(DrawTableBank::new(&draw_params(seed)));
     dump_static(out, &bank)?;
     for spec in &specs { run(spec, &bank, rate, stimuli, out)?; }
     Ok(())

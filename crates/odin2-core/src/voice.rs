@@ -1,7 +1,7 @@
 //! Voix Odin: Process.cpp:147-360, Voice.h:184-230, Amplifier.cpp:24-69.
 
 extern crate alloc;
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 use crate::dsp::effects::OversamplingDistortion;
 use crate::dsp::envelopes::{Adsr, Envelope};
 use crate::dsp::filters::PresetFilter;
@@ -127,9 +127,9 @@ impl Voice {
     }
 
     /// À appeler hors rendu après construction de la banque partagée par le moteur.
-    pub fn set_draw_tables(&mut self, tables: Rc<DrawTableBank>) {
-        for osc in &mut self.oscillators { osc.set_draw_tables(Rc::clone(&tables)); }
-        for lfo in &mut self.lfos { lfo.set_draw_tables(Rc::clone(&tables)); }
+    pub fn set_draw_tables(&mut self, tables: Arc<DrawTableBank>) {
+        for osc in &mut self.oscillators { osc.set_draw_tables(Arc::clone(&tables)); }
+        for lfo in &mut self.lfos { lfo.set_draw_tables(Arc::clone(&tables)); }
     }
 
     pub fn set_tempo(&mut self, bpm: f32) {
